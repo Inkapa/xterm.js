@@ -1,0 +1,16 @@
+{
+  "files.associations": {
+    ".eslintrc.json.typings": "jsonc"
+  },
+  "typescript.preferences.importModuleSpecifier": "non-relative",
+  "typescript.preferences.quoteStyle": "single",
+  "mochaExplorer.envPath": ".mocha.env",
+  "mochaExplorer.files": [
+    "out/**/*.test.js",
+    "addons/**/out/*.test.js"
+  ],
+  "mochaExplorer.watch": [
+    "out/**/*.js",
+    "addons/**/out/*.js"
+  ]
+}

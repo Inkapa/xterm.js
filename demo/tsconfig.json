@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "module": "commonjs",
+    "target": "es2021",
+    "rootDir": ".",
+    "sourceMap": true,
+    "baseUrl": ".",
+    "paths": {
+      "addon-attach": ["../addons/addon-attach"],
+      "addon-fit": ["../addons/addon-fit"],
+      "addon-image": ["../addons/addon-image"],
+      "addon-search": ["../addons/addon-search"],
+      "addon-serialize": ["../addons/addon-serialize"],
+      "addon-web-links": ["../addons/addon-web-links"],
+      "addon-webgl": ["../addons/addon-webgl"]
+    }
+  },
+  "include": [
+    "client.ts",
+    "../typings/xterm.d.ts"
+  ]
+}
