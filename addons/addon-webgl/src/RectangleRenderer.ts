@@ -337,7 +337,13 @@ export class RectangleRenderer extends Disposable {
     }
 
     if (vertices.attributes.length < offset + 4) {
-      vertices.attributes = expandFloat32Array(vertices.attributes, this._terminal.rows * this._terminal.cols * INDICES_PER_RECTANGLE);
+      // rectangleCount starts at 1 (index 0 is a reserved empty instance), so a
+      // fully non-default screen with no run-length merging (e.g. a checkerboard
+      // background) produces rows*cols rectangles at indices 1..rows*cols and
+      // needs rows*cols + 1 slots. Without the +1 the last rectangle overflows
+      // and the draw is rejected (drawElementsInstanced instance-fetch error),
+      // dropping every background.
+      vertices.attributes = expandFloat32Array(vertices.attributes, (this._terminal.rows * this._terminal.cols + 1) * INDICES_PER_RECTANGLE);
     }
     $x1 = startX * this._dimensions.device.cell.width;
     $y1 = y * this._dimensions.device.cell.height;
