@@ -29,6 +29,10 @@ const NULL_RASTERIZED_GLYPH: IRasterizedGlyph = {
   sizeClipSpace: { x: 0, y: 0 }
 };
 
+// The colour-carrying bits of a cell attribute (colour mode + 24-bit rgb / index).
+// Dropped from the glyph cache key so a glyph caches once per shape, not per colour.
+const GLYPH_COLOR_MASK = Attributes.CM_MASK | Attributes.RGB_MASK;
+
 const TMP_CANVAS_GLYPH_PADDING = 2;
 
 const enum Constants {
@@ -260,12 +264,46 @@ export class TextureAtlas implements ITextureAtlas {
     ext: number,
     restrictToCellHeight: boolean = false
   ): IRasterizedGlyph {
-    $glyph = cacheMap.get(key, bg, fg, ext);
+    // The rasterized glyph is a colour-independent coverage mask (see
+    // _drawToCache), so the colour bits are dropped from the cache key: a glyph
+    // is stored once and reused in every colour, and the atlas stops growing
+    // with the number of distinct colours on screen. Every flag (bold, italic,
+    // underline, dim, ...) stays in the key because those change the mask.
+    const keyBg = bg & ~GLYPH_COLOR_MASK;
+    const keyFg = fg & ~GLYPH_COLOR_MASK;
+    $glyph = cacheMap.get(key, keyBg, keyFg, ext);
     if (!$glyph) {
       $glyph = this._drawToCache(key, bg, fg, ext, restrictToCellHeight);
-      cacheMap.set(key, bg, fg, ext, $glyph);
+      cacheMap.set(key, keyBg, keyFg, ext, $glyph);
     }
     return $glyph;
+  }
+
+  /**
+   * The foreground colour for a cell, resolved the same way _drawToCache does
+   * (inverse swap, bold-in-bright, minimum contrast) but without dim, which is
+   * baked into the mask's opacity instead. Returned as packed 0xRRGGBBAA for the
+   * glyph renderer to hand the shader as the per-cell tint.
+   */
+  public getFgColor(bg: number, fg: number, ext: number, code: number): number {
+    this._workAttributeData.fg = fg;
+    this._workAttributeData.bg = bg;
+    this._workAttributeData.extended.ext = ext;
+    const inverse = !!this._workAttributeData.isInverse();
+    const bold = !!this._workAttributeData.isBold();
+    let fgColor = this._workAttributeData.getFgColor();
+    let fgColorMode = this._workAttributeData.getFgColorMode();
+    let bgColor = this._workAttributeData.getBgColor();
+    let bgColorMode = this._workAttributeData.getBgColorMode();
+    if (inverse) {
+      const t = fgColor; fgColor = bgColor; bgColor = t;
+      const t2 = fgColorMode; fgColorMode = bgColorMode; bgColorMode = t2;
+    }
+    return this._getForegroundColor(
+      bg, bgColorMode, bgColor, fg, fgColorMode, fgColor,
+      inverse, false /* dim is in the mask */, bold,
+      treatGlyphAsBackgroundColor(code)
+    ).rgba;
   }
 
   private _getColorFromAnsiIndex(idx: number): IColor {
@@ -490,7 +528,12 @@ export class TextureAtlas implements ITextureAtlas {
     const powerlineGlyph = chars.length === 1 && isPowerlineGlyph(chars.charCodeAt(0));
     const restrictedPowerlineGlyph = chars.length === 1 && isRestrictedPowerlineGlyph(chars.charCodeAt(0));
     const foregroundColor = this._getForegroundColor(bg, bgColorMode, bgColor, fg, fgColorMode, fgColor, inverse, dim, bold, treatGlyphAsBackgroundColor(chars.charCodeAt(0)));
-    this._tmpCtx.fillStyle = foregroundColor.css;
+    // Rasterize a colour-independent coverage mask: draw the glyph in white so
+    // one atlas entry serves every colour, and the real foreground colour is
+    // applied per cell in the shader (see GlyphRenderer). Dim is kept here, as
+    // reduced mask opacity, so it needs no per-cell handling. minimumContrastRatio
+    // is instead applied to the tint colour in getFgColor.
+    this._tmpCtx.fillStyle = `rgba(255, 255, 255, ${dim ? DIM_OPACITY : 1})`;
 
     // For powerline glyphs left/top padding is excluded (https://github.com/microsoft/vscode/issues/120129)
     const padding = restrictedPowerlineGlyph ? 0 : TMP_CANVAS_GLYPH_PADDING * 2;

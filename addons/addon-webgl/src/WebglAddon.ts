@@ -88,8 +88,15 @@ export class WebglAddon extends Disposable implements ITerminalAddon , IWebglApi
     renderService.setRenderer(this._renderer);
 
     this.register(toDisposable(() => {
-      const renderService: IRenderService = (this._terminal as any)._core._renderService;
-      renderService.setRenderer((this._terminal as any)._core._createRenderer());
+      const core = (this._terminal as any)._core;
+      // When the terminal itself is being disposed, its core services are torn
+      // down first and `_store` is already gone; restoring a renderer here would
+      // touch disposed internals and throw. Skip it in that case.
+      if (!core || !core._store || core._store._isDisposed) {
+        return;
+      }
+      const renderService: IRenderService = core._renderService;
+      renderService.setRenderer(core._createRenderer());
       renderService.handleResize(terminal.cols, terminal.rows);
     }));
   }
