@@ -3,6 +3,27 @@
  * @license MIT
  */
 
+// shaderBgModeValue maps the page's background shader-mode name onto the
+// rectangle renderer's u_badgl uniform.
+function shaderBgModeValue(name: string | undefined): number {
+  switch (name) {
+    case 'static': return 1;
+    case 'bands': return 2;
+    case 'scan': return 3;
+    case 'chan': return 4;
+    case 'neg': return 5;
+    case 'fade': return 6;
+    case 'flicker': return 7;
+    case 'vignette': return 8;
+    default: return 0;
+  }
+}
+
+// The glyph control surface: window.glyph, created by the page.
+function glyphCfg(): any {
+  return (typeof globalThis !== 'undefined' && (globalThis as any).glyph) || {};
+}
+
 import { throwIfFalsy } from 'browser/renderer/shared/RendererUtils';
 import { IRenderDimensions } from 'browser/renderer/shared/Types';
 import { IThemeService } from 'browser/services/Services';
@@ -43,11 +64,52 @@ precision lowp float;
 
 in vec4 v_color;
 
+uniform highp int u_badgl;
+uniform highp float u_time;
+uniform highp vec2 u_resolution;
+
 out vec4 outColor;
 
 void main() {
   outColor = v_color;
-}`;
+
+  // bad-GL background post-processing (window.glyph.shaderBg). Colour-only:
+  // the background pass has no texture to re-sample, so the lines and
+  // chroma modes are not offered here.
+  if (u_badgl == 1) {
+    // static: animated hash noise over the whole frame
+    float n = fract(sin(dot(gl_FragCoord.xy + vec2(u_time * 91.7, u_time * 47.3), vec2(12.9898, 78.233))) * 43758.5453);
+    outColor.rgb = mix(outColor.rgb, vec3(n), 0.35);
+  } else if (u_badgl == 2) {
+    // bands: darken rows in a moving band
+    float h = fract(sin(gl_FragCoord.y * 12.9898 + u_time * 53.0) * 43758.5453);
+    if (h > 0.7) {
+      outColor.rgb *= 0.6;
+    }
+  } else if (u_badgl == 3) {
+    // scan: darken alternating rows
+    if (mod(floor(gl_FragCoord.y), 2.0) < 1.0) {
+      outColor.rgb *= 0.6;
+    }
+  } else if (u_badgl == 4) {
+    // chan: swap the colour channels
+    outColor.rgb = outColor.gbr;
+  } else if (u_badgl == 5) {
+    // neg: invert
+    outColor = vec4(1.0) - outColor;
+  } else if (u_badgl == 6) {
+    // fade: translucent background
+    outColor.a *= 0.7;
+  } else if (u_badgl == 7) {
+    // flicker: brightness pulses softly
+    outColor.rgb *= 0.92 + 0.08 * sin(u_time * 7.0 + gl_FragCoord.x * 0.13);
+  } else if (u_badgl == 8) {
+    // vignette: darken toward the screen edges
+    vec2 uv = gl_FragCoord.xy / u_resolution;
+    float d = distance(uv, vec2(0.5));
+    outColor.rgb *= 1.0 - smoothstep(0.35, 0.78, d) * 0.6;
+  }
+}`;;
 
 const INDICES_PER_RECTANGLE = 8;
 const BYTES_PER_RECTANGLE = INDICES_PER_RECTANGLE * Float32Array.BYTES_PER_ELEMENT;
@@ -79,6 +141,10 @@ export class RectangleRenderer extends Disposable {
   private _vertexArrayObject: IWebGLVertexArrayObject;
   private _attributesBuffer: WebGLBuffer;
   private _projectionLocation: WebGLUniformLocation;
+  private _badglLocation: WebGLUniformLocation;
+  private _timeLocation: WebGLUniformLocation;
+  private _fragResolutionLocation: WebGLUniformLocation;
+  private _frameCount: number = 0;
   private _bgFloat!: Float32Array;
   private _cursorFloat!: Float32Array;
 
@@ -100,6 +166,9 @@ export class RectangleRenderer extends Disposable {
 
     // Uniform locations
     this._projectionLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_projection'));
+    this._badglLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_badgl'));
+    this._timeLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_time'));
+    this._fragResolutionLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_resolution'));
 
     // Create and set the vertex array object
     this._vertexArrayObject = gl.createVertexArray();
@@ -158,6 +227,12 @@ export class RectangleRenderer extends Disposable {
     gl.useProgram(this._program);
 
     gl.bindVertexArray(this._vertexArrayObject);
+
+    // bad-GL background shader modes, read live per frame.
+    gl.uniform1i(this._badglLocation, shaderBgModeValue(glyphCfg().shaderBg));
+    gl.uniform1f(this._timeLocation, this._frameCount);
+    this._frameCount++;
+    gl.uniform2f(this._fragResolutionLocation, gl.canvas.width, gl.canvas.height);
 
     gl.uniformMatrix4fv(this._projectionLocation, false, PROJECTION_MATRIX);
 
