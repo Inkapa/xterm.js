@@ -89,6 +89,12 @@ let $glyph: IRasterizedGlyph | undefined = undefined;
 let $leftCellPadding = 0;
 let $clippedPixels = 0;
 
+// The glyph control surface: window.glyph, created by the page. Absent in
+// tests and non-browser contexts, where the modes stay off.
+function glyphCfg(): any {
+  return (typeof globalThis !== 'undefined' && (globalThis as any).glyph) || {};
+}
+
 export class GlyphRenderer extends Disposable {
   private readonly _program: WebGLProgram;
   private readonly _vertexArrayObject: IWebGLVertexArrayObject;
@@ -284,6 +290,25 @@ export class GlyphRenderer extends Disposable {
       if (allowRescaling(code, width, $glyph.size.x, this._dimensions.device.cell.width)) {
         array[$i + 2] = (this._dimensions.device.cell.width - 1) / this._dimensions.device.canvas.width; // - 1 to improve readability
       }
+    }
+
+    // glyph bad-GL modes (window.glyph.badgl): deliberate renderer
+    // corruption, read live per cell. No atlas or shader state is
+    // touched, so the modes cannot break the page arrays.
+    const g = glyphCfg();
+    if (g.badgl === 'jitter') {
+      const h = (x * 73856093) ^ (y * 19349663) ^ (bg >>> 13) ^ (fg >>> 7);
+      const jx = ((h & 0xFFFF) / 0xFFFF - 0.5) * 2;
+      const jy = (((h >>> 16) & 0xFFFF) / 0xFFFF - 0.5) * 2;
+      array[$i] += jx * this._dimensions.device.char.width * 2;
+      array[$i + 1] += jy * this._dimensions.device.char.height * 2;
+    } else if (g.badgl === 'page') {
+      const n = Math.max(1, this._atlas.pages.length);
+      array[$i + 4] = (array[$i + 4] + 1) % n;
+    } else if (g.badgl === 'tex') {
+      const h = (x * 73856093) ^ (y * 19349663) ^ (bg >>> 13) ^ (fg >>> 7);
+      array[$i + 5] += (((h & 0xFFFF) / 0xFFFF) - 0.5) * 0.5;
+      array[$i + 6] += ((((h >>> 16) & 0xFFFF) / 0xFFFF) - 0.5) * 0.5;
     }
   }
 
