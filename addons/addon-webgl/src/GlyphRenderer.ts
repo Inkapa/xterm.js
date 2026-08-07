@@ -81,40 +81,49 @@ void main() {
   } ${textureConditionals}
 
   // bad-GL post-processing (window.glyph.shader), animated by u_time.
-  if (u_badgl == 1) {
+  // u_badgl is a bitmask, so several modes stack.
+  if ((u_badgl & 1) != 0) {
     // static: animated hash noise over the whole frame
     float n = fract(sin(dot(gl_FragCoord.xy + vec2(u_time * 91.7, u_time * 47.3), vec2(12.9898, 78.233))) * 43758.5453);
     outColor.rgb = mix(outColor.rgb, vec3(n), 0.35);
-  } else if (u_badgl == 2) {
+  }
+  if ((u_badgl & 2) != 0) {
     // lines: tearing rows, displaced samples
     float h = fract(sin(gl_FragCoord.y * 12.9898 + u_time * 53.0) * 43758.5453);
     if (h > 0.7) {
       vec2 d = vec2((h - 0.85) * 0.2, 0.0);
       outColor = texture(u_texture[v_texpage], v_texcoord + d);
     }
-  } else if (u_badgl == 3) {
+  }
+  if ((u_badgl & 4) != 0) {
     // scan: darken alternating rows
     if (mod(floor(gl_FragCoord.y), 2.0) < 1.0) {
       outColor.rgb *= 0.55;
     }
-  } else if (u_badgl == 4) {
+  }
+  if ((u_badgl & 8) != 0) {
     // chan: swap the colour channels
     outColor.rgb = outColor.gbr;
-  } else if (u_badgl == 5) {
+  }
+  if ((u_badgl & 16) != 0) {
     // neg: invert
     outColor = vec4(1.0) - outColor;
-  } else if (u_badgl == 6) {
+  }
+  if ((u_badgl & 32) != 0) {
     // fade: translucent glyphs
     outColor.a *= 0.55;
-  } else if (u_badgl == 7) {
+  }
+  if ((u_badgl & 64) != 0) {
     // flicker: brightness pulses softly
     outColor.rgb *= 0.92 + 0.08 * sin(u_time * 7.0 + gl_FragCoord.x * 0.13);
-  } else if (u_badgl == 8) {
+  }
+  if ((u_badgl & 128) != 0) {
     // chroma: channel separation, like an untuned CRT
     vec2 off = vec2(sin(u_time * 5.0) * 0.004, cos(u_time * 3.7) * 0.003);
     outColor.r = texture(u_texture[v_texpage], v_texcoord - off).r;
     outColor.b = texture(u_texture[v_texpage], v_texcoord + off).b;
-  } else if (u_badgl == 9) {
+  }
+  if ((u_badgl & 256) != 0) {
     // vignette: darken toward the screen edges
     vec2 uv = gl_FragCoord.xy / u_resolution;
     float d = distance(uv, vec2(0.5));
@@ -139,21 +148,25 @@ function glyphCfg(): any {
   return (typeof globalThis !== 'undefined' && (globalThis as any).glyph) || {};
 }
 
-// shaderModeValue maps the page's shader-mode name onto the fragment
-// shader's u_badgl uniform.
-function shaderModeValue(name: string | undefined): number {
-  switch (name) {
-    case 'static': return 1;
-    case 'lines': return 2;
-    case 'scan': return 3;
-    case 'chan': return 4;
-    case 'neg': return 5;
-    case 'fade': return 6;
-    case 'flicker': return 7;
-    case 'chroma': return 8;
-    case 'vignette': return 9;
-    default: return 0;
+// shaderMaskValue maps the page's shader-mode list onto the fragment
+// shader's u_badgl bitmask, so several modes stack.
+function shaderMaskValue(names: any): number {
+  let mask = 0;
+  const list: string[] = Array.isArray(names) ? names : (typeof names === 'string' && names !== 'off' ? [names] : []);
+  for (const n of list) {
+    switch (n) {
+      case 'static': mask |= 1; break;
+      case 'lines': mask |= 2; break;
+      case 'scan': mask |= 4; break;
+      case 'chan': mask |= 8; break;
+      case 'neg': mask |= 16; break;
+      case 'fade': mask |= 32; break;
+      case 'flicker': mask |= 64; break;
+      case 'chroma': mask |= 128; break;
+      case 'vignette': mask |= 256; break;
+    }
   }
+  return mask;
 }
 
 export class GlyphRenderer extends Disposable {
@@ -368,17 +381,38 @@ export class GlyphRenderer extends Disposable {
     }
 
     // glyph bad-GL modes (window.glyph.badgl): deliberate renderer
-    // corruption, read live per cell. No atlas or shader state is
-    // touched, so the modes cannot break the page arrays.
+    // corruption, read live per cell. The mode is a list, so several
+    // corruptions stack. mix overrides everything else per cell with one
+    // random mode. No atlas or shader state is touched, so the modes
+    // cannot break the page arrays.
     const g = glyphCfg();
+    let modes = g.badgl;
+    if (typeof modes === 'string') {
+      modes = modes === 'off' || !modes ? [] : [modes];
+    }
+    if (!modes || modes.length === 0) {
+      return;
+    }
     const hm = (x * 73856093) ^ (y * 19349663) ^ (bg >>> 13) ^ (fg >>> 7);
     const hA = (hm & 0xFFFF) / 0xFFFF;
     const hB = ((hm >>> 16) & 0xFFFF) / 0xFFFF;
     const cw = this._dimensions.device.char.width;
     const ch = this._dimensions.device.char.height;
-    let mode = g.badgl;
-    if (mode === 'mix') {
-      mode = ['jitter', 'page', 'tex', 'cut', 'stretch', 'shift', 'flip', 'skip', 'zebra', 'block', 'band'][Math.floor(hA * 11)];
+    if (modes.indexOf('mix') >= 0) {
+      const all = ['jitter', 'page', 'tex', 'cut', 'stretch', 'shift', 'flip', 'skip', 'zebra', 'block', 'band', 'drift', 'wobble', 'squint', 'snow'];
+      this._applyBadgl(array, $i, x, y, bg, fg, hA, hB, cw, ch, all[Math.floor(hA * all.length)]);
+      return;
+    }
+    for (let mi = 0; mi < modes.length; mi++) {
+      if (this._applyBadgl(array, $i, x, y, bg, fg, hA, hB, cw, ch, modes[mi])) {
+        return;
+      }
+    }
+  }
+
+  private _applyBadgl(array: Float32Array, $i: number, x: number, y: number, bg: number, fg: number, hA: number, hB: number, cw: number, ch: number, mode: string): boolean {
+    if (!this._atlas) {
+      return false;
     }
     switch (mode) {
       case 'jitter':
@@ -424,7 +458,7 @@ export class GlyphRenderer extends Disposable {
         // cells vanish: zero the vertex, the cell draws nothing
         if (hA < 0.25) {
           array.fill(0, $i, $i + INDICES_PER_CELL - 1 - CELL_POSITION_INDICES);
-          return;
+          return true;
         }
         break;
       case 'zebra':
@@ -468,6 +502,7 @@ export class GlyphRenderer extends Disposable {
         }
         break;
     }
+    return false;
   }
 
   public clear(): void {
@@ -520,7 +555,7 @@ export class GlyphRenderer extends Disposable {
 
     // bad-GL shader modes, read live per frame: the mode uniform plus an
     // animated time value for the post-processing block.
-    gl.uniform1i(this._badglLocation, shaderModeValue(glyphCfg().shader));
+    gl.uniform1i(this._badglLocation, shaderMaskValue(glyphCfg().shader));
     gl.uniform1f(this._timeLocation, this._frameCount);
     this._frameCount++;
 
