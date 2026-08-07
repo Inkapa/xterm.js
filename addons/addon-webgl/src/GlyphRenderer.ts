@@ -60,7 +60,7 @@ void main() {
 function createFragmentShaderSource(maxFragmentShaderTextureUnits: number): string {
   let textureConditionals = '';
   for (let i = 1; i < maxFragmentShaderTextureUnits; i++) {
-    textureConditionals += ` else if (v_texpage == ${i}) { outColor = texture(u_texture[${i}], v_texcoord); }`;
+    textureConditionals += ` else if (v_texpage == ${i}) { return texture(u_texture[${i}], uv); }`;
   }
   return (`#version 300 es
 precision lowp float;
@@ -69,13 +69,65 @@ in vec2 v_texcoord;
 flat in int v_texpage;
 
 uniform sampler2D u_texture[${maxFragmentShaderTextureUnits}];
+uniform int u_badgl;
+uniform float u_time;
+uniform vec2 u_resolution;
 
 out vec4 outColor;
 
-void main() {
+// Sample the atlas with a constant-index chain: GLSL ES 3.00 requires
+// sampler array indices to be constant integral expressions, so the page
+// selection cannot be a dynamic index.
+vec4 sampleAt(vec2 uv) {
   if (v_texpage == 0) {
-    outColor = texture(u_texture[0], v_texcoord);
+    return texture(u_texture[0], uv);
   } ${textureConditionals}
+  return vec4(0.0);
+}
+
+void main() {
+  outColor = sampleAt(v_texcoord);
+
+  // bad-GL post-processing (window.glyph.shader), animated by u_time.
+  if (u_badgl == 1) {
+    // static: animated hash noise over the whole frame
+    float n = fract(sin(dot(gl_FragCoord.xy + vec2(u_time * 91.7, u_time * 47.3), vec2(12.9898, 78.233))) * 43758.5453);
+    outColor.rgb = mix(outColor.rgb, vec3(n), 0.35);
+  } else if (u_badgl == 2) {
+    // lines: tearing rows, displaced samples
+    float h = fract(sin(gl_FragCoord.y * 12.9898 + u_time * 53.0) * 43758.5453);
+    if (h > 0.7) {
+      vec2 d = vec2((h - 0.85) * 0.2, 0.0);
+      outColor = sampleAt(v_texcoord + d);
+    }
+  } else if (u_badgl == 3) {
+    // scan: darken alternating rows
+    if (mod(floor(gl_FragCoord.y), 2.0) < 1.0) {
+      outColor.rgb *= 0.55;
+    }
+  } else if (u_badgl == 4) {
+    // chan: swap the colour channels
+    outColor.rgb = outColor.gbr;
+  } else if (u_badgl == 5) {
+    // neg: invert
+    outColor = vec4(1.0) - outColor;
+  } else if (u_badgl == 6) {
+    // fade: translucent glyphs
+    outColor.a *= 0.55;
+  } else if (u_badgl == 7) {
+    // flicker: brightness pulses softly
+    outColor.rgb *= 0.92 + 0.08 * sin(u_time * 7.0 + gl_FragCoord.x * 0.13);
+  } else if (u_badgl == 8) {
+    // chroma: channel separation, like an untuned CRT
+    vec2 off = vec2(sin(u_time * 5.0) * 0.004, cos(u_time * 3.7) * 0.003);
+    outColor.r = sampleAt(v_texcoord - off).r;
+    outColor.b = sampleAt(v_texcoord + off).b;
+  } else if (u_badgl == 9) {
+    // vignette: darken toward the screen edges
+    vec2 uv = gl_FragCoord.xy / u_resolution;
+    float d = distance(uv, vec2(0.5));
+    outColor.rgb *= 1.0 - smoothstep(0.35, 0.78, d) * 0.6;
+  }
 }`);
 }
 
@@ -89,6 +141,23 @@ let $glyph: IRasterizedGlyph | undefined = undefined;
 let $leftCellPadding = 0;
 let $clippedPixels = 0;
 
+// shaderModeValue maps the page's shader-mode name onto the fragment
+// shader's u_badgl uniform.
+function shaderModeValue(name: string | undefined): number {
+  switch (name) {
+    case 'static': return 1;
+    case 'lines': return 2;
+    case 'scan': return 3;
+    case 'chan': return 4;
+    case 'neg': return 5;
+    case 'fade': return 6;
+    case 'flicker': return 7;
+    case 'chroma': return 8;
+    case 'vignette': return 9;
+    default: return 0;
+  }
+}
+
 // The glyph control surface: window.glyph, created by the page. Absent in
 // tests and non-browser contexts, where the modes stay off.
 function glyphCfg(): any {
@@ -101,11 +170,15 @@ export class GlyphRenderer extends Disposable {
   private readonly _projectionLocation: WebGLUniformLocation;
   private readonly _resolutionLocation: WebGLUniformLocation;
   private readonly _textureLocation: WebGLUniformLocation;
+  private readonly _badglLocation: WebGLUniformLocation;
+  private readonly _timeLocation: WebGLUniformLocation;
+  private readonly _fragResolutionLocation: WebGLUniformLocation;
   private readonly _atlasTextures: GLTexture[];
   private readonly _attributesBuffer: WebGLBuffer;
 
   private _atlas: ITextureAtlas | undefined;
   private _activeBuffer: number = 0;
+  private _frameCount: number = 0;
   private readonly _vertices: IVertices = {
     count: 0,
     attributes: new Float32Array(0),
@@ -139,6 +212,9 @@ export class GlyphRenderer extends Disposable {
     this._projectionLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_projection'));
     this._resolutionLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_resolution'));
     this._textureLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_texture'));
+    this._badglLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_badgl'));
+    this._timeLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_time'));
+    this._fragResolutionLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_resolution'));
 
     // Create and set the vertex array object
     this._vertexArrayObject = gl.createVertexArray();
@@ -310,7 +386,7 @@ export class GlyphRenderer extends Disposable {
     const ch = this._dimensions.device.char.height;
     let mode = g.badgl;
     if (mode === 'mix') {
-      mode = ['jitter', 'page', 'tex', 'cut', 'stretch', 'shift'][Math.floor(hA * 6)];
+      mode = ['jitter', 'page', 'tex', 'cut', 'stretch', 'shift', 'flip', 'skip', 'zebra', 'block', 'band', 'drift', 'wobble', 'squint', 'snow'][Math.floor(hA * 15)];
     }
     switch (mode) {
       case 'jitter':
@@ -344,6 +420,62 @@ export class GlyphRenderer extends Disposable {
         // glyphs sit between cells and get cut at the cell edges
         array[$i] += cw * (hA < 0.5 ? -0.5 : 0.5);
         array[$i + 1] += ch * (hB < 0.5 ? -0.5 : 0.5);
+        break;
+      case 'flip':
+        // mirrored glyphs: negative texture span with an offset base
+        if (hA < 0.5) {
+          array[$i + 5] += array[$i + 7];
+          array[$i + 7] = -array[$i + 7];
+        } else {
+          array[$i + 6] += array[$i + 8];
+          array[$i + 8] = -array[$i + 8];
+        }
+        break;
+      case 'skip':
+        // cells vanish: zero the vertex, the cell draws nothing
+        if (hA < 0.25) {
+          array.fill(0, $i, $i + INDICES_PER_CELL - 1 - CELL_POSITION_INDICES);
+          return;
+        }
+        break;
+      case 'zebra':
+        // checkerboard of wrong texture regions
+        if (((x + y) & 1) === 0) {
+          array[$i + 5] += 0.25 * (hA - 0.5);
+          array[$i + 6] += 0.25 * (hB - 0.5);
+        }
+        break;
+      case 'block':
+        // whole 2x2 blocks corrupt together
+        if ((((x >> 1) * 73856093) ^ ((y >> 1) * 19349663) ^ (bg >>> 13) ^ (fg >>> 7) & 0xFFFF) / 0xFFFF < 0.4) {
+          array[$i + 5] += 0.4 * (hA - 0.5);
+          array[$i + 6] += 0.4 * (hB - 0.5);
+        }
+        break;
+      case 'band':
+        // wobbling stripes of garbage, the band position per column
+        // shifts with the cell colours
+        if (((y + Math.floor(hB * 8)) % 8) < 3) {
+          array[$i + 5] += 0.6 * (hA - 0.5);
+        }
+        break;      case 'drift':
+        // sub-pixel offset drift: glyphs sit slightly off, fuzzy edges
+        array[$i] += (hA - 0.5) * cw * 0.25;
+        array[$i + 1] += (hB - 0.5) * ch * 0.25;
+        break;
+      case 'wobble':
+        // gentle per-column wave
+        array[$i] += Math.sin(y * 0.35 + hB * 6.28) * cw * 0.3;
+        break;
+      case 'squint':
+        // glyphs slightly compressed
+        array[$i + 3] *= 0.85;
+        break;
+      case 'snow':
+        // rare cells nudge slightly off their texture region
+        if (hA < 0.05) {
+          array[$i + 5] += (hB - 0.5) * 0.2;
+        }
         break;
     }
   }
@@ -382,6 +514,7 @@ export class GlyphRenderer extends Disposable {
     gl.useProgram(this._program);
     gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
     gl.uniform2f(this._resolutionLocation, gl.canvas.width, gl.canvas.height);
+    gl.uniform2f(this._fragResolutionLocation, gl.canvas.width, gl.canvas.height);
     this.clear();
   }
 
@@ -394,6 +527,12 @@ export class GlyphRenderer extends Disposable {
 
     gl.useProgram(this._program);
     gl.bindVertexArray(this._vertexArrayObject);
+
+    // bad-GL shader modes, read live per frame: the mode uniform plus an
+    // animated time value for the post-processing block.
+    gl.uniform1i(this._badglLocation, shaderModeValue(glyphCfg().shader));
+    gl.uniform1f(this._timeLocation, this._frameCount);
+    this._frameCount++;
 
     // Alternate buffers each frame as the active buffer gets locked while it's in use by the GPU
     this._activeBuffer = (this._activeBuffer + 1) % 2;
