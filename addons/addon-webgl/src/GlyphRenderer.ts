@@ -420,7 +420,10 @@ export class GlyphRenderer extends Disposable {
         array[$i + 1] += (hB - 0.5) * 2 * ch * 2;
         break;
       case 'page':
-        array[$i + 4] = (array[$i + 4] + 1) % Math.max(1, this._atlas.pages.length);
+        // Draw each cell from the next atlas page, clamped to the bound
+        // sampler array: an index past it samples an unbound texture and
+        // renders black.
+        array[$i + 4] = (array[$i + 4] + 1) % Math.max(1, Math.min(this._atlas.pages.length, this._atlasTextures.length));
         break;
       case 'tex':
         array[$i + 5] += (hA - 0.5) * 0.5;
