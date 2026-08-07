@@ -251,6 +251,13 @@ export class GlyphRenderer extends Disposable {
 
     $leftCellPadding = Math.floor((this._dimensions.device.cell.width - this._dimensions.device.char.width) / 2);
     if (bg !== lastBg && $glyph.offset.x > $leftCellPadding) {
+      // The glyph may carry a stale page index from a mid-frame merge;
+      // the next frame reindexes, so drop the cell instead of throwing.
+      const texPage = this._atlas.pages[$glyph.texturePage];
+      if (!texPage) {
+        array.fill(0, $i, $i + INDICES_PER_CELL - 1 - CELL_POSITION_INDICES);
+        return;
+      }
       $clippedPixels = $glyph.offset.x - $leftCellPadding;
       // a_origin
       array[$i    ] = -($glyph.offset.x - $clippedPixels) + this._dimensions.device.char.left;
@@ -261,10 +268,10 @@ export class GlyphRenderer extends Disposable {
       // a_texpage
       array[$i + 4] = $glyph.texturePage;
       // a_texcoord
-      array[$i + 5] = $glyph.texturePositionClipSpace.x + $clippedPixels / this._atlas.pages[$glyph.texturePage].canvas.width;
+      array[$i + 5] = $glyph.texturePositionClipSpace.x + $clippedPixels / texPage.canvas.width;
       array[$i + 6] = $glyph.texturePositionClipSpace.y;
       // a_texsize
-      array[$i + 7] = $glyph.sizeClipSpace.x - $clippedPixels / this._atlas.pages[$glyph.texturePage].canvas.width;
+      array[$i + 7] = $glyph.sizeClipSpace.x - $clippedPixels / texPage.canvas.width;
       array[$i + 8] = $glyph.sizeClipSpace.y;
     } else {
       // a_origin
@@ -382,8 +389,12 @@ export class GlyphRenderer extends Disposable {
     gl.bindBuffer(gl.ARRAY_BUFFER, this._attributesBuffer);
     gl.bufferData(gl.ARRAY_BUFFER, activeBuffer.subarray(0, bufferLength), gl.STREAM_DRAW);
 
-    // Bind the atlas page texture if they have changed
-    for (let i = 0; i < this._atlas.pages.length; i++) {
+    // Bind the atlas page texture if they have changed. The texture array
+    // is sized at construction (one entry per shader sampler), while the
+    // atlas pages can grow past it under a colour flood; cells on pages
+    // beyond the array render as unbound-sampler garbage, which is the
+    // corruption, but the loop must not dereference past the array.
+    for (let i = 0; i < this._atlas.pages.length && i < this._atlasTextures.length; i++) {
       if (this._atlas.pages[i].version !== this._atlasTextures[i].version) {
         this._bindAtlasPageTexture(gl, this._atlas, i);
       }
