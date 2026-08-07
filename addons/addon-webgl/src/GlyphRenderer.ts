@@ -71,6 +71,7 @@ flat in int v_texpage;
 uniform sampler2D u_texture[${maxFragmentShaderTextureUnits}];
 uniform int u_badgl;
 uniform float u_time;
+uniform vec2 u_resolution;
 
 out vec4 outColor;
 
@@ -102,6 +103,22 @@ void main() {
   } else if (u_badgl == 5) {
     // neg: invert
     outColor = vec4(1.0) - outColor;
+  } else if (u_badgl == 6) {
+    // fade: translucent glyphs
+    outColor.a *= 0.55;
+  } else if (u_badgl == 7) {
+    // flicker: brightness pulses softly
+    outColor.rgb *= 0.92 + 0.08 * sin(u_time * 7.0 + gl_FragCoord.x * 0.13);
+  } else if (u_badgl == 8) {
+    // chroma: channel separation, like an untuned CRT
+    vec2 off = vec2(sin(u_time * 5.0) * 0.004, cos(u_time * 3.7) * 0.003);
+    outColor.r = texture(u_texture[v_texpage], v_texcoord - off).r;
+    outColor.b = texture(u_texture[v_texpage], v_texcoord + off).b;
+  } else if (u_badgl == 9) {
+    // vignette: darken toward the screen edges
+    vec2 uv = gl_FragCoord.xy / u_resolution;
+    float d = distance(uv, vec2(0.5));
+    outColor.rgb *= 1.0 - smoothstep(0.35, 0.78, d) * 0.6;
   }
 }`);
 }
@@ -131,6 +148,10 @@ function shaderModeValue(name: string | undefined): number {
     case 'scan': return 3;
     case 'chan': return 4;
     case 'neg': return 5;
+    case 'fade': return 6;
+    case 'flicker': return 7;
+    case 'chroma': return 8;
+    case 'vignette': return 9;
     default: return 0;
   }
 }
@@ -143,6 +164,7 @@ export class GlyphRenderer extends Disposable {
   private readonly _textureLocation: WebGLUniformLocation;
   private readonly _badglLocation: WebGLUniformLocation;
   private readonly _timeLocation: WebGLUniformLocation;
+  private readonly _fragResolutionLocation: WebGLUniformLocation;
   private readonly _atlasTextures: GLTexture[];
   private readonly _attributesBuffer: WebGLBuffer;
 
@@ -184,6 +206,7 @@ export class GlyphRenderer extends Disposable {
     this._textureLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_texture'));
     this._badglLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_badgl'));
     this._timeLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_time'));
+    this._fragResolutionLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_resolution'));
 
     // Create and set the vertex array object
     this._vertexArrayObject = gl.createVertexArray();
@@ -428,6 +451,25 @@ export class GlyphRenderer extends Disposable {
           array[$i + 5] += 0.6 * (hA - 0.5);
         }
         break;
+      case 'drift':
+        // sub-pixel offset drift: glyphs sit slightly off, fuzzy edges
+        array[$i] += (hA - 0.5) * cw * 0.25;
+        array[$i + 1] += (hB - 0.5) * ch * 0.25;
+        break;
+      case 'wobble':
+        // gentle per-column wave
+        array[$i] += Math.sin(y * 0.35 + hB * 6.28) * cw * 0.3;
+        break;
+      case 'squint':
+        // glyphs slightly compressed
+        array[$i + 3] *= 0.85;
+        break;
+      case 'snow':
+        // rare cells nudge slightly off their texture region
+        if (hA < 0.05) {
+          array[$i + 5] += (hB - 0.5) * 0.2;
+        }
+        break;
     }
   }
 
@@ -465,6 +507,7 @@ export class GlyphRenderer extends Disposable {
     gl.useProgram(this._program);
     gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
     gl.uniform2f(this._resolutionLocation, gl.canvas.width, gl.canvas.height);
+    gl.uniform2f(this._fragResolutionLocation, gl.canvas.width, gl.canvas.height);
     this.clear();
   }
 
