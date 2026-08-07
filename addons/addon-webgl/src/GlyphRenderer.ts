@@ -69,9 +69,9 @@ in vec2 v_texcoord;
 flat in int v_texpage;
 
 uniform sampler2D u_texture[${maxFragmentShaderTextureUnits}];
-uniform int u_badgl;
-uniform float u_time;
-uniform vec2 u_resolution;
+uniform highp int u_badgl;
+uniform highp float u_time;
+uniform highp vec2 u_resolution;
 
 out vec4 outColor;
 
