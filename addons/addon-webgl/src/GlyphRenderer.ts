@@ -61,17 +61,25 @@ void main() {
   v_color = a_color;
 }`;
 
-// The atlas stores each glyph as a colour-independent coverage mask (white,
-// with dim baked into its opacity), so one entry serves a glyph in any colour
-// and the atlas no longer grows with the number of distinct colours on screen.
-// The per-cell foreground colour arrives in a_color and tints the mask here.
-// Because the atlas is drawn with a transparent background (allowTransparency),
-// the mask holds straight-alpha coverage, so `colour * mask` is identical to
-// the previously baked `colour-in-texture` result.
-function createFragmentShaderSource(maxFragmentShaderTextureUnits: number): string {
+// The glyph control surface, see TextureAtlas.glyphCfg.
+function glyphCfg(): any {
+  return (typeof globalThis !== 'undefined' && (globalThis as any).glyph) || {};
+}
+
+// In tint mode the atlas stores each glyph as a colour-independent coverage
+// mask (white, with dim baked into its opacity), so one entry serves a glyph
+// in any colour and the atlas no longer grows with the number of distinct
+// colours on screen. The per-cell foreground colour arrives in a_color and
+// tints the mask here. Because the atlas is drawn with a transparent
+// background (allowTransparency), the mask holds straight-alpha coverage, so
+// `colour * mask` is identical to the previously baked `colour-in-texture`
+// result. In stock mode the colour is baked into the texture and the shader
+// samples it directly, which is what lets a colour flood corrupt the atlas.
+function createFragmentShaderSource(maxFragmentShaderTextureUnits: number, stock: boolean): string {
+  const tint = stock ? '' : 'v_color * ';
   let textureConditionals = '';
   for (let i = 1; i < maxFragmentShaderTextureUnits; i++) {
-    textureConditionals += ` else if (v_texpage == ${i}) { outColor = v_color * texture(u_texture[${i}], v_texcoord); }`;
+    textureConditionals += ` else if (v_texpage == ${i}) { outColor = ${tint}texture(u_texture[${i}], v_texcoord); }`;
   }
   return (`#version 300 es
 precision lowp float;
@@ -86,7 +94,7 @@ out vec4 outColor;
 
 void main() {
   if (v_texpage == 0) {
-    outColor = v_color * texture(u_texture[0], v_texcoord);
+    outColor = ${tint}texture(u_texture[0], v_texcoord);
   } ${textureConditionals}
 }`);
 }
@@ -108,7 +116,7 @@ let $clippedPixels = 0;
 let $fgRgba = 0;
 
 export class GlyphRenderer extends Disposable {
-  private readonly _program: WebGLProgram;
+  private _program!: WebGLProgram;
   private readonly _vertexArrayObject: IWebGLVertexArrayObject;
   private readonly _projectionLocation: WebGLUniformLocation;
   private readonly _resolutionLocation: WebGLUniformLocation;
@@ -144,7 +152,8 @@ export class GlyphRenderer extends Disposable {
       TextureAtlas.maxTextureSize = throwIfFalsy(gl.getParameter(gl.MAX_TEXTURE_SIZE) as number | null);
     }
 
-    this._program = throwIfFalsy(createProgram(gl, vertexShaderSource, createFragmentShaderSource(TextureAtlas.maxAtlasPages)));
+    glyphCfg()._renderer = this;
+    this._updateProgram();
     this.register(toDisposable(() => gl.deleteProgram(this._program)));
 
     // Uniform locations
@@ -202,8 +211,8 @@ export class GlyphRenderer extends Disposable {
 
     // Setup static uniforms
     gl.useProgram(this._program);
-    const textureUnits = new Int32Array(TextureAtlas.maxAtlasPages);
-    for (let i = 0; i < TextureAtlas.maxAtlasPages; i++) {
+    const textureUnits = new Int32Array(TextureAtlas.glyphPages()!);
+    for (let i = 0; i < TextureAtlas.glyphPages()!; i++) {
       textureUnits[i] = i;
     }
     gl.uniform1iv(this._textureLocation, textureUnits);
@@ -212,7 +221,7 @@ export class GlyphRenderer extends Disposable {
     // Setup 1x1 red pixel textures for all potential atlas pages, if one of these invalid textures
     // is ever drawn it will show characters as red rectangles.
     this._atlasTextures = [];
-    for (let i = 0; i < TextureAtlas.maxAtlasPages; i++) {
+    for (let i = 0; i < TextureAtlas.glyphPages()!; i++) {
       const glTexture = new GLTexture(throwIfFalsy(gl.createTexture()));
       this.register(toDisposable(() => gl.deleteTexture(glTexture.texture)));
       gl.activeTexture(gl.TEXTURE0 + i);
@@ -233,6 +242,36 @@ export class GlyphRenderer extends Disposable {
 
   public beginFrame(): boolean {
     return this._atlas ? this._atlas.beginFrame() : true;
+  }
+
+  /**
+   * Recompile the fragment shader for the current glyph mode (tint or
+   * stock). Called by the page's setMode; the atlas keys and rasterisation
+   * switch happens implicitly because they read the mode live.
+   */
+  private _updateProgram(): void {
+    const gl = this._gl;
+    const old = this._program;
+    this._program = throwIfFalsy(createProgram(
+      gl,
+      vertexShaderSource,
+      createFragmentShaderSource(TextureAtlas.glyphPages()!, glyphCfg().mode === 'stock')
+    ));
+    if (old) {
+      gl.deleteProgram(old);
+    }
+  }
+
+  public setMode(): void {
+    this._updateProgram();
+    const gl = this._gl;
+    gl.useProgram(this._program);
+    const textureUnits = new Int32Array(TextureAtlas.glyphPages()!);
+    for (let i = 0; i < TextureAtlas.glyphPages()!; i++) {
+      textureUnits[i] = i;
+    }
+    gl.uniform1iv(this._textureLocation, textureUnits);
+    gl.uniformMatrix4fv(this._projectionLocation, false, PROJECTION_MATRIX);
   }
 
   public updateCell(x: number, y: number, code: number, bg: number, fg: number, ext: number, chars: string, width: number, lastBg: number): void {

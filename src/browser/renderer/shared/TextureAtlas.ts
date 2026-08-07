@@ -58,6 +58,13 @@ interface ICharAtlasActiveRow {
 // Work variables to avoid garbage collection
 let $glyph = undefined;
 
+// The glyph control surface (see glyph's docs/atlas.md). window.glyph is
+// created by the page before the addon loads; when absent the fork keeps
+// the stock tinted behaviour and GPU defaults.
+function glyphCfg(): any {
+  return (typeof globalThis !== 'undefined' && (globalThis as any).glyph) || {};
+}
+
 export class TextureAtlas implements ITextureAtlas {
   private _didWarmUp: boolean = false;
 
@@ -83,6 +90,29 @@ export class TextureAtlas implements ITextureAtlas {
   public static maxAtlasPages: number | undefined;
   public static maxTextureSize: number | undefined;
 
+  /**
+   * The live page cap: the window.glyph knob when set, else the GPU-derived
+   * default. Read wherever the stock code read maxAtlasPages.
+   */
+  public static glyphPages(): number | undefined {
+    const g = glyphCfg();
+    if (g.pages && g.pages > 0) {
+      return g.pages;
+    }
+    return TextureAtlas.maxAtlasPages;
+  }
+
+  /**
+   * The live texture size cap, see glyphPages.
+   */
+  public static glyphTex(): number | undefined {
+    const g = glyphCfg();
+    if (g.tex && g.tex > 0) {
+      return g.tex;
+    }
+    return TextureAtlas.maxTextureSize;
+  }
+
   private readonly _onAddTextureAtlasCanvas = new EventEmitter<HTMLCanvasElement>();
   public readonly onAddTextureAtlasCanvas = this._onAddTextureAtlasCanvas.event;
   private readonly _onRemoveTextureAtlasCanvas = new EventEmitter<HTMLCanvasElement>();
@@ -93,6 +123,7 @@ export class TextureAtlas implements ITextureAtlas {
     private readonly _config: ICharAtlasConfig,
     private readonly _unicodeService: IUnicodeService
   ) {
+    glyphCfg()._atlas = this;
     this._createNewPage();
     this._tmpCanvas = createCanvas(
       _document,
@@ -134,6 +165,13 @@ export class TextureAtlas implements ITextureAtlas {
 
   private _requestClearModel = false;
   public beginFrame(): boolean {
+    const g = glyphCfg();
+    if (g.force) {
+      // A pending force request re-rasterises every cell on the next frame.
+      g.force = 0;
+      this._didWarmUp = false;
+      this._requestClearModel = true;
+    }
     return this._requestClearModel;
   }
 
@@ -154,11 +192,11 @@ export class TextureAtlas implements ITextureAtlas {
     // microtask to ensure it does not interrupt textures that will be rendered in the current
     // animation frame which would result in blank rendered areas. This is actually not that
     // expensive relative to drawing the glyphs, so there is no need to wait for an idle callback.
-    if (TextureAtlas.maxAtlasPages && this._pages.length >= Math.max(4, TextureAtlas.maxAtlasPages)) {
+    if (TextureAtlas.glyphPages() && this._pages.length >= Math.max(4, TextureAtlas.glyphPages()!)) {
       // Find the set of the largest 4 images, below the maximum size, with the highest
       // percentages used
       const pagesBySize = this._pages.filter(e => {
-        return e.canvas.width * 2 <= (TextureAtlas.maxTextureSize || Constants.FORCED_MAX_TEXTURE_SIZE);
+        return e.canvas.width * 2 <= (TextureAtlas.glyphTex() || Constants.FORCED_MAX_TEXTURE_SIZE);
       }).sort((a, b) => {
         if (b.canvas.width !== a.canvas.width) {
           return b.canvas.width - a.canvas.width;
@@ -264,13 +302,17 @@ export class TextureAtlas implements ITextureAtlas {
     ext: number,
     restrictToCellHeight: boolean = false
   ): IRasterizedGlyph {
-    // The rasterized glyph is a colour-independent coverage mask (see
-    // _drawToCache), so the colour bits are dropped from the cache key: a glyph
-    // is stored once and reused in every colour, and the atlas stops growing
-    // with the number of distinct colours on screen. Every flag (bold, italic,
-    // underline, dim, ...) stays in the key because those change the mask.
-    const keyBg = bg & ~GLYPH_COLOR_MASK;
-    const keyFg = fg & ~GLYPH_COLOR_MASK;
+    // In tint mode (the default) the rasterized glyph is a colour-independent
+    // coverage mask (see _drawToCache), so the colour bits are dropped from the
+    // cache key: a glyph is stored once and reused in every colour, and the
+    // atlas stops growing with the number of distinct colours on screen. Every
+    // flag (bold, italic, underline, dim, ...) stays in the key because those
+    // change the mask. In stock mode the colour is baked into the texture, so
+    // the full colour bits stay in the key and a colour flood grows the atlas
+    // until the pages merge and corrupt (the deliberate glyph behaviour).
+    const stock = glyphCfg().mode === 'stock';
+    const keyBg = stock ? bg : bg & ~GLYPH_COLOR_MASK;
+    const keyFg = stock ? fg : fg & ~GLYPH_COLOR_MASK;
     $glyph = cacheMap.get(key, keyBg, keyFg, ext);
     if (!$glyph) {
       $glyph = this._drawToCache(key, bg, fg, ext, restrictToCellHeight);
@@ -528,12 +570,21 @@ export class TextureAtlas implements ITextureAtlas {
     const powerlineGlyph = chars.length === 1 && isPowerlineGlyph(chars.charCodeAt(0));
     const restrictedPowerlineGlyph = chars.length === 1 && isRestrictedPowerlineGlyph(chars.charCodeAt(0));
     const foregroundColor = this._getForegroundColor(bg, bgColorMode, bgColor, fg, fgColorMode, fgColor, inverse, dim, bold, treatGlyphAsBackgroundColor(chars.charCodeAt(0)));
-    // Rasterize a colour-independent coverage mask: draw the glyph in white so
-    // one atlas entry serves every colour, and the real foreground colour is
-    // applied per cell in the shader (see GlyphRenderer). Dim is kept here, as
-    // reduced mask opacity, so it needs no per-cell handling. minimumContrastRatio
-    // is instead applied to the tint colour in getFgColor.
-    this._tmpCtx.fillStyle = `rgba(255, 255, 255, ${dim ? DIM_OPACITY : 1})`;
+    if (glyphCfg().mode === 'stock') {
+      // Stock mode: bake the resolved foreground colour (dim included) into
+      // the rasterised glyph, the way the upstream addon did before the tint
+      // fix. The atlas keys on colour here, so a per-cell colour flood grows
+      // it until the pages merge and corrupt.
+      this._tmpCtx.fillStyle = foregroundColor.css;
+    } else {
+      // Tint mode (default): rasterize a colour-independent coverage mask —
+      // draw the glyph in white so one atlas entry serves every colour, and
+      // the real foreground colour is applied per cell in the shader (see
+      // GlyphRenderer). Dim is kept here, as reduced mask opacity, so it needs
+      // no per-cell handling. minimumContrastRatio is instead applied to the
+      // tint colour in getFgColor.
+      this._tmpCtx.fillStyle = `rgba(255, 255, 255, ${dim ? DIM_OPACITY : 1})`;
+    }
 
     // For powerline glyphs left/top padding is excluded (https://github.com/microsoft/vscode/issues/120129)
     const padding = restrictedPowerlineGlyph ? 0 : TMP_CANVAS_GLYPH_PADDING * 2;
@@ -839,8 +890,8 @@ export class TextureAtlas implements ITextureAtlas {
             // improve texture utilization by using the available space before the page is merged
             // and becomes static.
             if (
-              TextureAtlas.maxAtlasPages &&
-              this._pages.length >= TextureAtlas.maxAtlasPages &&
+              TextureAtlas.glyphPages() &&
+              this._pages.length >= TextureAtlas.glyphPages()! &&
               activeRow.y + rasterizedGlyph.size.y <= activePage.canvas.height &&
               activeRow.height >= rasterizedGlyph.size.y &&
               activeRow.x + rasterizedGlyph.size.x <= activePage.canvas.width
