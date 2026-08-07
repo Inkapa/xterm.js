@@ -303,19 +303,45 @@ export class GlyphRenderer extends Disposable {
     // corruption, read live per cell. No atlas or shader state is
     // touched, so the modes cannot break the page arrays.
     const g = glyphCfg();
-    if (g.badgl === 'jitter') {
-      const h = (x * 73856093) ^ (y * 19349663) ^ (bg >>> 13) ^ (fg >>> 7);
-      const jx = ((h & 0xFFFF) / 0xFFFF - 0.5) * 2;
-      const jy = (((h >>> 16) & 0xFFFF) / 0xFFFF - 0.5) * 2;
-      array[$i] += jx * this._dimensions.device.char.width * 2;
-      array[$i + 1] += jy * this._dimensions.device.char.height * 2;
-    } else if (g.badgl === 'page') {
-      const n = Math.max(1, this._atlas.pages.length);
-      array[$i + 4] = (array[$i + 4] + 1) % n;
-    } else if (g.badgl === 'tex') {
-      const h = (x * 73856093) ^ (y * 19349663) ^ (bg >>> 13) ^ (fg >>> 7);
-      array[$i + 5] += (((h & 0xFFFF) / 0xFFFF) - 0.5) * 0.5;
-      array[$i + 6] += ((((h >>> 16) & 0xFFFF) / 0xFFFF) - 0.5) * 0.5;
+    const hm = (x * 73856093) ^ (y * 19349663) ^ (bg >>> 13) ^ (fg >>> 7);
+    const hA = (hm & 0xFFFF) / 0xFFFF;
+    const hB = ((hm >>> 16) & 0xFFFF) / 0xFFFF;
+    const cw = this._dimensions.device.char.width;
+    const ch = this._dimensions.device.char.height;
+    let mode = g.badgl;
+    if (mode === 'mix') {
+      mode = ['jitter', 'page', 'tex', 'cut', 'stretch', 'shift'][Math.floor(hA * 6)];
+    }
+    switch (mode) {
+      case 'jitter':
+        array[$i] += (hA - 0.5) * 2 * cw * 2;
+        array[$i + 1] += (hB - 0.5) * 2 * ch * 2;
+        break;
+      case 'page':
+        array[$i + 4] = (array[$i + 4] + 1) % Math.max(1, this._atlas.pages.length);
+        break;
+      case 'tex':
+        array[$i + 5] += (hA - 0.5) * 0.5;
+        array[$i + 6] += (hB - 0.5) * 0.5;
+        break;
+      case 'cut':
+        // half-cut characters: the quad is clipped top or bottom
+        if (hA < 0.5) {
+          array[$i + 3] *= 0.5;
+        } else {
+          array[$i + 1] += ch / 2;
+          array[$i + 3] *= 0.5;
+        }
+        break;
+      case 'stretch':
+        array[$i + 2] *= 0.6 + 1.4 * hA;
+        array[$i + 3] *= 0.6 + 0.8 * hB;
+        break;
+      case 'shift':
+        // glyphs sit between cells and get cut at the cell edges
+        array[$i] += cw * (hA < 0.5 ? -0.5 : 0.5);
+        array[$i + 1] += ch * (hB < 0.5 ? -0.5 : 0.5);
+        break;
     }
   }
 
