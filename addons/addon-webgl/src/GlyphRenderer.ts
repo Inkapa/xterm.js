@@ -142,67 +142,87 @@ void main() {
   outColor = sampleAt(v_texcoord);
 
   // bad-GL post-processing (window.glyph.shader), animated by u_time.
-  if (u_badgl == 1) {
+  // u_badgl is a bitmask, one bit per filter, so several stack in a single
+  // pass and compose in ascending bit order. shaderModeValue in the page
+  // ORs the requested modes together; a single mode is just one bit. The
+  // baseline cost is a handful of bitwise tests; only stacking the
+  // atlas-resampling filters (chroma, wave, mosaic, echo, bleed, dither)
+  // adds real texture work, so that is where a heavy stack meets its limit.
+  if ((u_badgl & 1) != 0) {
     // static: animated hash noise over the whole frame
     float n = fract(sin(dot(gl_FragCoord.xy + vec2(u_time * 91.7, u_time * 47.3), vec2(12.9898, 78.233))) * 43758.5453);
     outColor.rgb = mix(outColor.rgb, vec3(n), 0.35);
-  } else if (u_badgl == 2) {
+  }
+  if ((u_badgl & 2) != 0) {
     // lines: tearing rows, displaced samples
     float h = fract(sin(gl_FragCoord.y * 12.9898 + u_time * 53.0) * 43758.5453);
     if (h > 0.7) {
       vec2 d = vec2((h - 0.85) * 0.2, 0.0);
       outColor = sampleAt(v_texcoord + d);
     }
-  } else if (u_badgl == 3) {
+  }
+  if ((u_badgl & 4) != 0) {
     // scan: darken alternating rows
     if (mod(floor(gl_FragCoord.y), 2.0) < 1.0) {
       outColor.rgb *= 0.55;
     }
-  } else if (u_badgl == 4) {
+  }
+  if ((u_badgl & 8) != 0) {
     // chan: swap the colour channels
     outColor.rgb = outColor.gbr;
-  } else if (u_badgl == 5) {
+  }
+  if ((u_badgl & 16) != 0) {
     // neg: invert
     outColor = vec4(1.0) - outColor;
-  } else if (u_badgl == 6) {
+  }
+  if ((u_badgl & 32) != 0) {
     // fade: translucent glyphs
     outColor.a *= 0.55;
-  } else if (u_badgl == 7) {
+  }
+  if ((u_badgl & 64) != 0) {
     // flicker: brightness pulses softly
     outColor.rgb *= 0.92 + 0.08 * sin(u_time * 7.0 + gl_FragCoord.x * 0.13);
-  } else if (u_badgl == 8) {
+  }
+  if ((u_badgl & 128) != 0) {
     // chroma: channel separation, like an untuned CRT
     vec2 off = vec2(sin(u_time * 5.0) * 0.004, cos(u_time * 3.7) * 0.003);
     outColor.r = sampleAt(v_texcoord - off).r;
     outColor.b = sampleAt(v_texcoord + off).b;
-  } else if (u_badgl == 9) {
+  }
+  if ((u_badgl & 256) != 0) {
     // vignette: darken toward the screen edges
     vec2 uv = gl_FragCoord.xy / u_resolution;
     float d = distance(uv, vec2(0.5));
     outColor.rgb *= 1.0 - smoothstep(0.35, 0.78, d) * 0.6;
-  } else if (u_badgl == 10) {
+  }
+  if ((u_badgl & 512) != 0) {
     // wave: the sampled glyph ripples through a moving sine warp
     vec2 w = vec2(sin(v_texcoord.y * 60.0 + u_time * 0.2) * 0.006,
                   cos(v_texcoord.x * 60.0 + u_time * 0.17) * 0.006);
     outColor = sampleAt(v_texcoord + w);
-  } else if (u_badgl == 11) {
+  }
+  if ((u_badgl & 1024) != 0) {
     // mosaic: snap texture coordinates to a coarse grid, chunky pixels
     vec2 grid = vec2(0.012);
     outColor = sampleAt(floor(v_texcoord / grid) * grid);
-  } else if (u_badgl == 12) {
+  }
+  if ((u_badgl & 2048) != 0) {
     // echo: a ghost of the glyph, offset and added, a smeared trail
     outColor.rgb += sampleAt(v_texcoord - vec2(0.01, 0.0)).rgb * 0.6;
-  } else if (u_badgl == 13) {
+  }
+  if ((u_badgl & 4096) != 0) {
     // bleed: horizontal RGB smear, the channels run to the right
     outColor.r = sampleAt(v_texcoord - vec2(0.004, 0.0)).r;
     outColor.g = sampleAt(v_texcoord - vec2(0.008, 0.0)).g;
     outColor.b = sampleAt(v_texcoord - vec2(0.012, 0.0)).b;
-  } else if (u_badgl == 14) {
+  }
+  if ((u_badgl & 8192) != 0) {
     // dither: 1-bit ordered dithering, luminance thresholded against the
     // Bayer matrix so the glyph breaks into a black/white stipple
     float lum = dot(outColor.rgb, vec3(0.299, 0.587, 0.114));
     outColor.rgb = vec3(step(ditherThreshold(gl_FragCoord.xy), lum));
-  } else if (u_badgl == 15) {
+  }
+  if ((u_badgl & 16384) != 0) {
     // bayer: colour ordered dither, each channel quantised to 4 levels with
     // the threshold nudging the rounding so the banding stipples instead
     float d = ditherThreshold(gl_FragCoord.xy) - 0.5;
@@ -221,27 +241,41 @@ let $glyph: IRasterizedGlyph | undefined = undefined;
 let $leftCellPadding = 0;
 let $clippedPixels = 0;
 
-// shaderModeValue maps the page's shader-mode name onto the fragment
-// shader's u_badgl uniform.
-function shaderModeValue(name: string | undefined): number {
-  switch (name) {
+// shaderBit maps one foreground filter name onto its bit in the u_badgl
+// mask. The bit order is the order the filters compose in the shader.
+function shaderBit(name: string): number {
+  switch (name.trim()) {
     case 'static': return 1;
     case 'lines': return 2;
-    case 'scan': return 3;
-    case 'chan': return 4;
-    case 'neg': return 5;
-    case 'fade': return 6;
-    case 'flicker': return 7;
-    case 'chroma': return 8;
-    case 'vignette': return 9;
-    case 'wave': return 10;
-    case 'mosaic': return 11;
-    case 'echo': return 12;
-    case 'bleed': return 13;
-    case 'dither': return 14;
-    case 'bayer': return 15;
+    case 'scan': return 4;
+    case 'chan': return 8;
+    case 'neg': return 16;
+    case 'fade': return 32;
+    case 'flicker': return 64;
+    case 'chroma': return 128;
+    case 'vignette': return 256;
+    case 'wave': return 512;
+    case 'mosaic': return 1024;
+    case 'echo': return 2048;
+    case 'bleed': return 4096;
+    case 'dither': return 8192;
+    case 'bayer': return 16384;
     default: return 0;
   }
+}
+
+// shaderModeValue turns the page's shader field into the u_badgl bitmask.
+// It accepts a comma-separated list ('chroma,scan,dither'), so several
+// filters stack in one pass; a single name is just one bit.
+function shaderModeValue(name: string | undefined): number {
+  if (!name) {
+    return 0;
+  }
+  let mask = 0;
+  for (const part of name.split(',')) {
+    mask |= shaderBit(part);
+  }
+  return mask;
 }
 
 // vtxModeValue maps the page's vertex-warp name onto the u_vtx uniform,

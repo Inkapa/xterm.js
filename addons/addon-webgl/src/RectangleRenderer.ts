@@ -3,24 +3,37 @@
  * @license MIT
  */
 
-// shaderBgModeValue maps the page's background shader-mode name onto the
-// rectangle renderer's u_badgl uniform.
-function shaderBgModeValue(name: string | undefined): number {
-  switch (name) {
+// shaderBgBit maps one background filter name onto its bit in the u_badgl
+// mask, in the order the filters compose in the shader.
+function shaderBgBit(name: string): number {
+  switch (name.trim()) {
     case 'static': return 1;
     case 'bands': return 2;
-    case 'scan': return 3;
-    case 'chan': return 4;
-    case 'neg': return 5;
-    case 'fade': return 6;
-    case 'flicker': return 7;
-    case 'vignette': return 8;
-    case 'mosaic': return 9;
-    case 'sweep': return 10;
-    case 'dither': return 11;
-    case 'bayer': return 12;
+    case 'scan': return 4;
+    case 'chan': return 8;
+    case 'neg': return 16;
+    case 'fade': return 32;
+    case 'flicker': return 64;
+    case 'vignette': return 128;
+    case 'mosaic': return 256;
+    case 'sweep': return 512;
+    case 'dither': return 1024;
+    case 'bayer': return 2048;
     default: return 0;
   }
+}
+
+// shaderBgModeValue turns the page's background shader field into the
+// u_badgl bitmask, accepting a comma-separated list so filters stack.
+function shaderBgModeValue(name: string | undefined): number {
+  if (!name) {
+    return 0;
+  }
+  let mask = 0;
+  for (const part of name.split(',')) {
+    mask |= shaderBgBit(part);
+  }
+  return mask;
 }
 
 // The glyph control surface: window.glyph, created by the page.
@@ -118,57 +131,70 @@ float ditherThreshold(vec2 fragCoord) {
 void main() {
   outColor = v_color;
 
-  // bad-GL background post-processing (window.glyph.shaderBg). Colour-only:
-  // the background pass has no texture to re-sample, so the lines and
-  // chroma modes are not offered here.
-  if (u_badgl == 1) {
+  // bad-GL background post-processing (window.glyph.shaderBg). u_badgl is a
+  // bitmask (one bit per filter), so several stack in one pass and compose
+  // in ascending bit order; shaderBgModeValue ORs the requested modes.
+  // Colour-only: the background pass has no texture to re-sample, so the
+  // lines and chroma modes are not offered here.
+  if ((u_badgl & 1) != 0) {
     // static: animated hash noise over the whole frame
     float n = fract(sin(dot(gl_FragCoord.xy + vec2(u_time * 91.7, u_time * 47.3), vec2(12.9898, 78.233))) * 43758.5453);
     outColor.rgb = mix(outColor.rgb, vec3(n), 0.35);
-  } else if (u_badgl == 2) {
+  }
+  if ((u_badgl & 2) != 0) {
     // bands: darken rows in a moving band
     float h = fract(sin(gl_FragCoord.y * 12.9898 + u_time * 53.0) * 43758.5453);
     if (h > 0.7) {
       outColor.rgb *= 0.6;
     }
-  } else if (u_badgl == 3) {
+  }
+  if ((u_badgl & 4) != 0) {
     // scan: darken alternating rows
     if (mod(floor(gl_FragCoord.y), 2.0) < 1.0) {
       outColor.rgb *= 0.6;
     }
-  } else if (u_badgl == 4) {
+  }
+  if ((u_badgl & 8) != 0) {
     // chan: swap the colour channels
     outColor.rgb = outColor.gbr;
-  } else if (u_badgl == 5) {
+  }
+  if ((u_badgl & 16) != 0) {
     // neg: invert
     outColor = vec4(1.0) - outColor;
-  } else if (u_badgl == 6) {
+  }
+  if ((u_badgl & 32) != 0) {
     // fade: translucent background
     outColor.a *= 0.7;
-  } else if (u_badgl == 7) {
+  }
+  if ((u_badgl & 64) != 0) {
     // flicker: brightness pulses softly
     outColor.rgb *= 0.92 + 0.08 * sin(u_time * 7.0 + gl_FragCoord.x * 0.13);
-  } else if (u_badgl == 8) {
+  }
+  if ((u_badgl & 128) != 0) {
     // vignette: darken toward the screen edges
     vec2 uv = gl_FragCoord.xy / u_resolution;
     float d = distance(uv, vec2(0.5));
     outColor.rgb *= 1.0 - smoothstep(0.35, 0.78, d) * 0.6;
-  } else if (u_badgl == 9) {
+  }
+  if ((u_badgl & 256) != 0) {
     // mosaic: block-quantised noise modulates the background colour
     vec2 blk = floor(gl_FragCoord.xy / 16.0);
     float n = fract(sin(dot(blk, vec2(12.9898, 78.233)) + u_time * 0.1) * 43758.5453);
     outColor.rgb *= 0.4 + 0.6 * n;
-  } else if (u_badgl == 10) {
+  }
+  if ((u_badgl & 512) != 0) {
     // sweep: a bright bar scans down the screen
     float sy = gl_FragCoord.y / u_resolution.y;
     float bar = smoothstep(0.03, 0.0, abs(fract(sy - u_time * 0.01) - 0.5));
     outColor.rgb += bar * 0.5;
-  } else if (u_badgl == 11) {
+  }
+  if ((u_badgl & 1024) != 0) {
     // dither: 1-bit ordered dithering of the background luminance, the
     // full-screen colour field broken into a black/white stipple
     float lum = dot(outColor.rgb, vec3(0.299, 0.587, 0.114));
     outColor.rgb = vec3(step(ditherThreshold(gl_FragCoord.xy), lum));
-  } else if (u_badgl == 12) {
+  }
+  if ((u_badgl & 2048) != 0) {
     // bayer: colour ordered dither, 4 levels per channel, so the field
     // posterises into stippled bands instead of smooth gradients
     float d = ditherThreshold(gl_FragCoord.xy) - 0.5;
