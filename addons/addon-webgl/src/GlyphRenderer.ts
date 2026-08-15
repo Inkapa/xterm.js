@@ -48,6 +48,7 @@ uniform mat4 u_projection;
 uniform vec2 u_resolution;
 uniform highp int u_vtx;
 uniform highp float u_vtime;
+uniform highp float u_intensity;
 
 out vec2 v_texcoord;
 flat out int v_texpage;
@@ -88,7 +89,10 @@ vec4 warpVertex(vec4 pos) {
 
 void main() {
   vec2 zeroToOne = (a_offset / u_resolution) + a_cellpos + (a_unitquad * a_size);
-  gl_Position = warpVertex(u_projection * vec4(zeroToOne, 0.0, 1.0));
+  vec4 base = u_projection * vec4(zeroToOne, 0.0, 1.0);
+  // u_intensity (0..1) scales the warp: 0 leaves the frame undistorted, 1
+  // is the full warp, so a tween fades the distortion in and out.
+  gl_Position = mix(base, warpVertex(base), u_intensity);
   v_texpage = int(a_texpage);
   v_texcoord = a_texcoord + a_unitquad * a_texsize;
 }`;
@@ -108,6 +112,7 @@ uniform sampler2D u_texture[${maxFragmentShaderTextureUnits}];
 uniform highp int u_badgl;
 uniform highp float u_time;
 uniform highp vec2 u_resolution;
+uniform highp float u_intensity;
 
 out vec4 outColor;
 
@@ -140,6 +145,9 @@ float ditherThreshold(vec2 fragCoord) {
 
 void main() {
   outColor = sampleAt(v_texcoord);
+  // The unfiltered glyph, kept so u_intensity can crossfade the whole
+  // filter stack back toward it (0 = clean text, 1 = full stack).
+  vec4 glyphClean = outColor;
 
   // bad-GL post-processing (window.glyph.shader), animated by u_time.
   // u_badgl is a bitmask, one bit per filter, so several stack in a single
@@ -228,6 +236,10 @@ void main() {
     float d = ditherThreshold(gl_FragCoord.xy) - 0.5;
     outColor.rgb = clamp(floor(outColor.rgb * 3.0 + 0.5 + d), 0.0, 3.0) / 3.0;
   }
+
+  // Master crossfade: scale the whole filtered result back toward the
+  // untouched glyph by u_intensity.
+  outColor = mix(glyphClean, outColor, u_intensity);
 }`);
 }
 
@@ -300,6 +312,17 @@ function glyphCfg(): any {
   return (typeof globalThis !== 'undefined' && (globalThis as any).glyph) || {};
 }
 
+// intensityValue reads the master glitch intensity (0..1) from the page's
+// params bag, clamped. It scales the continuous stages (the vertex warp and
+// the fragment filters) so a tween or a reactive driver can fade the whole
+// glitch in and out. Defaults to 1 (full) when unset. Exported so the
+// rectangle renderer reads the same value and the background matches.
+export function intensityValue(): number {
+  const p = glyphCfg().params;
+  const v = p && typeof p.intensity === 'number' ? p.intensity : 1;
+  return v < 0 ? 0 : (v > 1 ? 1 : v);
+}
+
 export class GlyphRenderer extends Disposable {
   private readonly _program: WebGLProgram;
   private readonly _vertexArrayObject: IWebGLVertexArrayObject;
@@ -311,6 +334,7 @@ export class GlyphRenderer extends Disposable {
   private readonly _fragResolutionLocation: WebGLUniformLocation;
   private readonly _vtxLocation: WebGLUniformLocation;
   private readonly _vtimeLocation: WebGLUniformLocation;
+  private readonly _intensityLocation: WebGLUniformLocation;
   private readonly _atlasTextures: GLTexture[];
   private readonly _attributesBuffer: WebGLBuffer;
 
@@ -355,6 +379,9 @@ export class GlyphRenderer extends Disposable {
     this._fragResolutionLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_resolution'));
     this._vtxLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_vtx'));
     this._vtimeLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_vtime'));
+    // u_intensity is declared in both stages of this program, so it links to
+    // one shared location that the vertex and fragment shaders both read.
+    this._intensityLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_intensity'));
 
     // Create and set the vertex array object
     this._vertexArrayObject = gl.createVertexArray();
@@ -725,6 +752,7 @@ export class GlyphRenderer extends Disposable {
     gl.uniform1f(this._timeLocation, this._frameCount);
     gl.uniform1i(this._vtxLocation, vtxModeValue(glyphCfg().vtx));
     gl.uniform1f(this._vtimeLocation, this._frameCount);
+    gl.uniform1f(this._intensityLocation, intensityValue());
     this._frameCount++;
 
     // Alternate buffers each frame as the active buffer gets locked while it's in use by the GPU

@@ -52,7 +52,7 @@ import { Terminal } from '@xterm/xterm';
 import { RENDER_MODEL_BG_OFFSET, RENDER_MODEL_FG_OFFSET, RENDER_MODEL_INDICIES_PER_CELL } from './RenderModel';
 import { IRenderModel, IWebGL2RenderingContext, IWebGLVertexArrayObject } from './Types';
 import { createProgram, expandFloat32Array, PROJECTION_MATRIX } from './WebglUtils';
-import { vtxModeValue } from './GlyphRenderer';
+import { vtxModeValue, intensityValue } from './GlyphRenderer';
 
 const enum VertexAttribLocations {
   POSITION = 0,
@@ -70,6 +70,7 @@ layout (location = ${VertexAttribLocations.UNIT_QUAD}) in vec2 a_unitquad;
 uniform mat4 u_projection;
 uniform highp int u_vtx;
 uniform highp float u_vtime;
+uniform highp float u_intensity;
 
 out vec4 v_color;
 
@@ -99,7 +100,10 @@ vec4 warpVertex(vec4 pos) {
 
 void main() {
   vec2 zeroToOne = a_position + (a_unitquad * a_size);
-  gl_Position = warpVertex(u_projection * vec4(zeroToOne, 0.0, 1.0));
+  vec4 base = u_projection * vec4(zeroToOne, 0.0, 1.0);
+  // Scale the warp by u_intensity, matching the glyph renderer so the
+  // background and foreground fade together.
+  gl_Position = mix(base, warpVertex(base), u_intensity);
   v_color = a_color;
 }`;
 
@@ -113,6 +117,8 @@ uniform highp float u_time;
 uniform highp vec2 u_resolution;
 
 out vec4 outColor;
+
+uniform highp float u_intensity;
 
 // 4x4 Bayer ordered-dither threshold matrix (kept in sync with the glyph
 // renderer). Ordered dithering is the single-pass, O(1)-per-fragment
@@ -130,6 +136,9 @@ float ditherThreshold(vec2 fragCoord) {
 
 void main() {
   outColor = v_color;
+  // The untouched background colour, kept so u_intensity can crossfade the
+  // filter stack back toward it (0 = plain background, 1 = full stack).
+  vec4 bgClean = outColor;
 
   // bad-GL background post-processing (window.glyph.shaderBg). u_badgl is a
   // bitmask (one bit per filter), so several stack in one pass and compose
@@ -200,6 +209,9 @@ void main() {
     float d = ditherThreshold(gl_FragCoord.xy) - 0.5;
     outColor.rgb = clamp(floor(outColor.rgb * 3.0 + 0.5 + d), 0.0, 3.0) / 3.0;
   }
+
+  // Master crossfade back toward the plain background by u_intensity.
+  outColor = mix(bgClean, outColor, u_intensity);
 }`;;
 
 const INDICES_PER_RECTANGLE = 8;
@@ -237,6 +249,7 @@ export class RectangleRenderer extends Disposable {
   private _fragResolutionLocation: WebGLUniformLocation;
   private _vtxLocation: WebGLUniformLocation;
   private _vtimeLocation: WebGLUniformLocation;
+  private _intensityLocation: WebGLUniformLocation;
   private _frameCount: number = 0;
   private _bgFloat!: Float32Array;
   private _cursorFloat!: Float32Array;
@@ -264,6 +277,7 @@ export class RectangleRenderer extends Disposable {
     this._fragResolutionLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_resolution'));
     this._vtxLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_vtx'));
     this._vtimeLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_vtime'));
+    this._intensityLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_intensity'));
 
     // Create and set the vertex array object
     this._vertexArrayObject = gl.createVertexArray();
@@ -328,6 +342,7 @@ export class RectangleRenderer extends Disposable {
     gl.uniform1f(this._timeLocation, this._frameCount);
     gl.uniform1i(this._vtxLocation, vtxModeValue(glyphCfg().vtx));
     gl.uniform1f(this._vtimeLocation, this._frameCount);
+    gl.uniform1f(this._intensityLocation, intensityValue());
     this._frameCount++;
     gl.uniform2f(this._fragResolutionLocation, gl.canvas.width, gl.canvas.height);
 
