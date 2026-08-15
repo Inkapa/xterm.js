@@ -37,6 +37,7 @@ import { Terminal } from '@xterm/xterm';
 import { RENDER_MODEL_BG_OFFSET, RENDER_MODEL_FG_OFFSET, RENDER_MODEL_INDICIES_PER_CELL } from './RenderModel';
 import { IRenderModel, IWebGL2RenderingContext, IWebGLVertexArrayObject } from './Types';
 import { createProgram, expandFloat32Array, PROJECTION_MATRIX } from './WebglUtils';
+import { vtxModeValue } from './GlyphRenderer';
 
 const enum VertexAttribLocations {
   POSITION = 0,
@@ -52,12 +53,38 @@ layout (location = ${VertexAttribLocations.COLOR}) in vec4 a_color;
 layout (location = ${VertexAttribLocations.UNIT_QUAD}) in vec2 a_unitquad;
 
 uniform mat4 u_projection;
+uniform highp int u_vtx;
+uniform highp float u_vtime;
 
 out vec4 v_color;
 
+// warpVertex must match the glyph renderer's block exactly so the
+// background bends together with the foreground (window.glyph.vtx).
+vec4 warpVertex(vec4 pos) {
+  vec2 p = pos.xy;
+  if (u_vtx == 1) {
+    pos.xy = p * (1.0 + 0.18 * dot(p, p));
+  } else if (u_vtx == 2) {
+    pos.x += p.y * 0.25;
+  } else if (u_vtx == 3) {
+    pos.xy += vec2(sin(u_vtime * 1.7), cos(u_vtime * 2.3)) * 0.02;
+  } else if (u_vtx == 4) {
+    pos.x += sin(p.y * 10.0 + u_vtime * 0.2) * 0.03;
+  } else if (u_vtx == 5) {
+    pos.xy = p * (1.0 - 0.25 * exp(-dot(p, p) * 3.0));
+  } else if (u_vtx == 6) {
+    float a = length(p) * 0.8 + u_vtime * 0.01;
+    float s = sin(a), c = cos(a);
+    pos.xy = mat2(c, -s, s, c) * p;
+  } else if (u_vtx == 7) {
+    pos.y += mod(u_vtime * 0.02, 2.0) - 1.0;
+  }
+  return pos;
+}
+
 void main() {
   vec2 zeroToOne = a_position + (a_unitquad * a_size);
-  gl_Position = u_projection * vec4(zeroToOne, 0.0, 1.0);
+  gl_Position = warpVertex(u_projection * vec4(zeroToOne, 0.0, 1.0));
   v_color = a_color;
 }`;
 
@@ -156,6 +183,8 @@ export class RectangleRenderer extends Disposable {
   private _badglLocation: WebGLUniformLocation;
   private _timeLocation: WebGLUniformLocation;
   private _fragResolutionLocation: WebGLUniformLocation;
+  private _vtxLocation: WebGLUniformLocation;
+  private _vtimeLocation: WebGLUniformLocation;
   private _frameCount: number = 0;
   private _bgFloat!: Float32Array;
   private _cursorFloat!: Float32Array;
@@ -181,6 +210,8 @@ export class RectangleRenderer extends Disposable {
     this._badglLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_badgl'));
     this._timeLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_time'));
     this._fragResolutionLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_resolution'));
+    this._vtxLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_vtx'));
+    this._vtimeLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_vtime'));
 
     // Create and set the vertex array object
     this._vertexArrayObject = gl.createVertexArray();
@@ -243,6 +274,8 @@ export class RectangleRenderer extends Disposable {
     // bad-GL background shader modes, read live per frame.
     gl.uniform1i(this._badglLocation, shaderBgModeValue(glyphCfg().shaderBg));
     gl.uniform1f(this._timeLocation, this._frameCount);
+    gl.uniform1i(this._vtxLocation, vtxModeValue(glyphCfg().vtx));
+    gl.uniform1f(this._vtimeLocation, this._frameCount);
     this._frameCount++;
     gl.uniform2f(this._fragResolutionLocation, gl.canvas.width, gl.canvas.height);
 

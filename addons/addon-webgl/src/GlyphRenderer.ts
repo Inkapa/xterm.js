@@ -46,13 +46,49 @@ layout (location = ${VertexAttribLocations.TEXSIZE}) in vec2 a_texsize;
 
 uniform mat4 u_projection;
 uniform vec2 u_resolution;
+uniform highp int u_vtx;
+uniform highp float u_vtime;
 
 out vec2 v_texcoord;
 flat out int v_texpage;
 
+// warpVertex distorts the whole frame at the vertex stage
+// (window.glyph.vtx). Unlike the per-cell geometry pass these are smooth,
+// screen-coherent warps: every quad shares them, so the foreground and the
+// background (which runs the identical block) bend together. Applied in
+// clip space, which is NDC here because the projection is orthographic.
+vec4 warpVertex(vec4 pos) {
+  vec2 p = pos.xy;
+  if (u_vtx == 1) {
+    // barrel: CRT bulge, corners pushed outward
+    pos.xy = p * (1.0 + 0.18 * dot(p, p));
+  } else if (u_vtx == 2) {
+    // shear: the screen skews sideways with height
+    pos.x += p.y * 0.25;
+  } else if (u_vtx == 3) {
+    // quake: the whole image shakes on its own
+    pos.xy += vec2(sin(u_vtime * 1.7), cos(u_vtime * 2.3)) * 0.02;
+  } else if (u_vtx == 4) {
+    // ripple: a travelling horizontal wave, like a flapping flag
+    pos.x += sin(p.y * 10.0 + u_vtime * 0.2) * 0.03;
+  } else if (u_vtx == 5) {
+    // pinch: the centre gets sucked inward
+    pos.xy = p * (1.0 - 0.25 * exp(-dot(p, p) * 3.0));
+  } else if (u_vtx == 6) {
+    // twist: a swirl whose angle grows with radius and drifts in time
+    float a = length(p) * 0.8 + u_vtime * 0.01;
+    float s = sin(a), c = cos(a);
+    pos.xy = mat2(c, -s, s, c) * p;
+  } else if (u_vtx == 7) {
+    // roll: the picture slides down and snaps back, a vertical hold desync
+    pos.y += mod(u_vtime * 0.02, 2.0) - 1.0;
+  }
+  return pos;
+}
+
 void main() {
   vec2 zeroToOne = (a_offset / u_resolution) + a_cellpos + (a_unitquad * a_size);
-  gl_Position = u_projection * vec4(zeroToOne, 0.0, 1.0);
+  gl_Position = warpVertex(u_projection * vec4(zeroToOne, 0.0, 1.0));
   v_texpage = int(a_texpage);
   v_texcoord = a_texcoord + a_unitquad * a_texsize;
 }`;
@@ -179,6 +215,22 @@ function shaderModeValue(name: string | undefined): number {
   }
 }
 
+// vtxModeValue maps the page's vertex-warp name onto the u_vtx uniform,
+// shared by the glyph and rectangle vertex shaders so the whole frame
+// warps coherently.
+export function vtxModeValue(name: string | undefined): number {
+  switch (name) {
+    case 'barrel': return 1;
+    case 'shear': return 2;
+    case 'quake': return 3;
+    case 'ripple': return 4;
+    case 'pinch': return 5;
+    case 'twist': return 6;
+    case 'roll': return 7;
+    default: return 0;
+  }
+}
+
 // The glyph control surface: window.glyph, created by the page. Absent in
 // tests and non-browser contexts, where the modes stay off.
 function glyphCfg(): any {
@@ -194,6 +246,8 @@ export class GlyphRenderer extends Disposable {
   private readonly _badglLocation: WebGLUniformLocation;
   private readonly _timeLocation: WebGLUniformLocation;
   private readonly _fragResolutionLocation: WebGLUniformLocation;
+  private readonly _vtxLocation: WebGLUniformLocation;
+  private readonly _vtimeLocation: WebGLUniformLocation;
   private readonly _atlasTextures: GLTexture[];
   private readonly _attributesBuffer: WebGLBuffer;
 
@@ -236,6 +290,8 @@ export class GlyphRenderer extends Disposable {
     this._badglLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_badgl'));
     this._timeLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_time'));
     this._fragResolutionLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_resolution'));
+    this._vtxLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_vtx'));
+    this._vtimeLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_vtime'));
 
     // Create and set the vertex array object
     this._vertexArrayObject = gl.createVertexArray();
@@ -604,6 +660,8 @@ export class GlyphRenderer extends Disposable {
     // animated time value for the post-processing block.
     gl.uniform1i(this._badglLocation, shaderModeValue(glyphCfg().shader));
     gl.uniform1f(this._timeLocation, this._frameCount);
+    gl.uniform1i(this._vtxLocation, vtxModeValue(glyphCfg().vtx));
+    gl.uniform1f(this._vtimeLocation, this._frameCount);
     this._frameCount++;
 
     // Alternate buffers each frame as the active buffer gets locked while it's in use by the GPU
