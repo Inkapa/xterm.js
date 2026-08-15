@@ -127,6 +127,23 @@ void main() {
     vec2 uv = gl_FragCoord.xy / u_resolution;
     float d = distance(uv, vec2(0.5));
     outColor.rgb *= 1.0 - smoothstep(0.35, 0.78, d) * 0.6;
+  } else if (u_badgl == 10) {
+    // wave: the sampled glyph ripples through a moving sine warp
+    vec2 w = vec2(sin(v_texcoord.y * 60.0 + u_time * 0.2) * 0.006,
+                  cos(v_texcoord.x * 60.0 + u_time * 0.17) * 0.006);
+    outColor = sampleAt(v_texcoord + w);
+  } else if (u_badgl == 11) {
+    // mosaic: snap texture coordinates to a coarse grid, chunky pixels
+    vec2 grid = vec2(0.012);
+    outColor = sampleAt(floor(v_texcoord / grid) * grid);
+  } else if (u_badgl == 12) {
+    // echo: a ghost of the glyph, offset and added, a smeared trail
+    outColor.rgb += sampleAt(v_texcoord - vec2(0.01, 0.0)).rgb * 0.6;
+  } else if (u_badgl == 13) {
+    // bleed: horizontal RGB smear, the channels run to the right
+    outColor.r = sampleAt(v_texcoord - vec2(0.004, 0.0)).r;
+    outColor.g = sampleAt(v_texcoord - vec2(0.008, 0.0)).g;
+    outColor.b = sampleAt(v_texcoord - vec2(0.012, 0.0)).b;
   }
 }`);
 }
@@ -154,6 +171,10 @@ function shaderModeValue(name: string | undefined): number {
     case 'flicker': return 7;
     case 'chroma': return 8;
     case 'vignette': return 9;
+    case 'wave': return 10;
+    case 'mosaic': return 11;
+    case 'echo': return 12;
+    case 'bleed': return 13;
     default: return 0;
   }
 }
@@ -386,7 +407,7 @@ export class GlyphRenderer extends Disposable {
     const ch = this._dimensions.device.char.height;
     let mode = g.badgl;
     if (mode === 'mix') {
-      mode = ['jitter', 'page', 'tex', 'cut', 'stretch', 'shift', 'flip', 'skip', 'zebra', 'block', 'band', 'drift', 'wobble', 'squint', 'snow'][Math.floor(hA * 15)];
+      mode = ['jitter', 'page', 'tex', 'cut', 'stretch', 'shift', 'flip', 'skip', 'zebra', 'block', 'band', 'drift', 'wobble', 'squint', 'snow', 'melt', 'tear', 'throb', 'explode', 'spike', 'crush'][Math.floor(hA * 21)];
     }
     switch (mode) {
       case 'jitter':
@@ -475,6 +496,57 @@ export class GlyphRenderer extends Disposable {
         // rare cells nudge slightly off their texture region
         if (hA < 0.05) {
           array[$i + 5] += (hB - 0.5) * 0.2;
+        }
+        break;
+      case 'melt':
+        // time-driven drip: each cell slides downward at a speed set by
+        // its hash and wraps after a few rows, so the screen runs like
+        // wet ink and the layout never settles.
+        array[$i + 1] += (this._frameCount * (0.4 + hA) * 2 + hB * ch * 8) % (ch * 8);
+        break;
+      case 'tear':
+        // horizontal tracking tear: whole rows jump sideways together,
+        // the shift per row wandering with time like a mistuned VHS head.
+        {
+          const t = Math.sin(y * 0.7 + this._frameCount * 0.08);
+          if (t > 0.6) {
+            array[$i] += (t - 0.6) * cw * 20;
+          }
+        }
+        break;
+      case 'throb':
+        // time-driven breathing: every cell pulses in size, overshooting
+        // 1 so glyphs swell over their neighbours and contract to nothing.
+        {
+          const p = 0.5 + 1.1 * (0.5 + 0.5 * Math.sin(this._frameCount * 0.15 + hA * 6.28));
+          array[$i + 2] *= p;
+          array[$i + 3] *= p;
+        }
+        break;
+      case 'explode':
+        // radial blast from the screen centre: glyphs fly outward, the
+        // far ones leaving the viewport entirely.
+        {
+          const dx = (x / this._terminal.cols) - 0.5;
+          const dy = (y / this._terminal.rows) - 0.5;
+          array[$i]     += dx * cw * (4 + hA * 12);
+          array[$i + 1] += dy * ch * (4 + hB * 12);
+        }
+        break;
+      case 'spike':
+        // rare cells detonate to many times their size: one stamp smeared
+        // across a whole region, overflowing its neighbours.
+        if (hA < 0.03) {
+          array[$i + 2] *= 6 + hB * 10;
+          array[$i + 3] *= 6 + hA * 10;
+        }
+        break;
+      case 'crush':
+        // random rows of cells collapse to a single scanline, a
+        // dying-CRT horizontal streak.
+        if (hB < 0.3) {
+          array[$i + 3] *= 0.06;
+          array[$i + 1] += ch * 0.5;
         }
         break;
     }

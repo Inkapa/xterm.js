@@ -15,6 +15,8 @@ function shaderBgModeValue(name: string | undefined): number {
     case 'fade': return 6;
     case 'flicker': return 7;
     case 'vignette': return 8;
+    case 'mosaic': return 9;
+    case 'sweep': return 10;
     default: return 0;
   }
 }
@@ -108,6 +110,16 @@ void main() {
     vec2 uv = gl_FragCoord.xy / u_resolution;
     float d = distance(uv, vec2(0.5));
     outColor.rgb *= 1.0 - smoothstep(0.35, 0.78, d) * 0.6;
+  } else if (u_badgl == 9) {
+    // mosaic: block-quantised noise modulates the background colour
+    vec2 blk = floor(gl_FragCoord.xy / 16.0);
+    float n = fract(sin(dot(blk, vec2(12.9898, 78.233)) + u_time * 0.1) * 43758.5453);
+    outColor.rgb *= 0.4 + 0.6 * n;
+  } else if (u_badgl == 10) {
+    // sweep: a bright bar scans down the screen
+    float sy = gl_FragCoord.y / u_resolution.y;
+    float bar = smoothstep(0.03, 0.0, abs(fract(sy - u_time * 0.01) - 0.5));
+    outColor.rgb += bar * 0.5;
   }
 }`;;
 
