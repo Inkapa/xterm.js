@@ -17,6 +17,8 @@ function shaderBgModeValue(name: string | undefined): number {
     case 'vignette': return 8;
     case 'mosaic': return 9;
     case 'sweep': return 10;
+    case 'dither': return 11;
+    case 'bayer': return 12;
     default: return 0;
   }
 }
@@ -99,6 +101,20 @@ uniform highp vec2 u_resolution;
 
 out vec4 outColor;
 
+// 4x4 Bayer ordered-dither threshold matrix (kept in sync with the glyph
+// renderer). Ordered dithering is the single-pass, O(1)-per-fragment
+// stand-in for error diffusion, which is serial and cannot run in one pass.
+const float bayer4x4[16] = float[16](
+   0.0/16.0,  8.0/16.0,  2.0/16.0, 10.0/16.0,
+  12.0/16.0,  4.0/16.0, 14.0/16.0,  6.0/16.0,
+   3.0/16.0, 11.0/16.0,  1.0/16.0,  9.0/16.0,
+  15.0/16.0,  7.0/16.0, 13.0/16.0,  5.0/16.0);
+
+float ditherThreshold(vec2 fragCoord) {
+  ivec2 p = ivec2(mod(fragCoord, 4.0));
+  return bayer4x4[p.y * 4 + p.x];
+}
+
 void main() {
   outColor = v_color;
 
@@ -147,6 +163,16 @@ void main() {
     float sy = gl_FragCoord.y / u_resolution.y;
     float bar = smoothstep(0.03, 0.0, abs(fract(sy - u_time * 0.01) - 0.5));
     outColor.rgb += bar * 0.5;
+  } else if (u_badgl == 11) {
+    // dither: 1-bit ordered dithering of the background luminance, the
+    // full-screen colour field broken into a black/white stipple
+    float lum = dot(outColor.rgb, vec3(0.299, 0.587, 0.114));
+    outColor.rgb = vec3(step(ditherThreshold(gl_FragCoord.xy), lum));
+  } else if (u_badgl == 12) {
+    // bayer: colour ordered dither, 4 levels per channel, so the field
+    // posterises into stippled bands instead of smooth gradients
+    float d = ditherThreshold(gl_FragCoord.xy) - 0.5;
+    outColor.rgb = clamp(floor(outColor.rgb * 3.0 + 0.5 + d), 0.0, 3.0) / 3.0;
   }
 }`;;
 

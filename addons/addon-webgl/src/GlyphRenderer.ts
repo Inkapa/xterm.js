@@ -121,6 +121,23 @@ vec4 sampleAt(vec2 uv) {
   return vec4(0.0);
 }
 
+// 4x4 Bayer ordered-dither threshold matrix, normalised to [0,1). Ordered
+// dithering is the single-pass equivalent of error diffusion: each pixel
+// picks its output level by comparing against a fixed screen-space
+// threshold, so it stays O(1) per fragment with no extra samples. True
+// Floyd-Steinberg diffuses each pixel's error to its neighbours, which is
+// serial and cannot run in one fragment pass.
+const float bayer4x4[16] = float[16](
+   0.0/16.0,  8.0/16.0,  2.0/16.0, 10.0/16.0,
+  12.0/16.0,  4.0/16.0, 14.0/16.0,  6.0/16.0,
+   3.0/16.0, 11.0/16.0,  1.0/16.0,  9.0/16.0,
+  15.0/16.0,  7.0/16.0, 13.0/16.0,  5.0/16.0);
+
+float ditherThreshold(vec2 fragCoord) {
+  ivec2 p = ivec2(mod(fragCoord, 4.0));
+  return bayer4x4[p.y * 4 + p.x];
+}
+
 void main() {
   outColor = sampleAt(v_texcoord);
 
@@ -180,6 +197,16 @@ void main() {
     outColor.r = sampleAt(v_texcoord - vec2(0.004, 0.0)).r;
     outColor.g = sampleAt(v_texcoord - vec2(0.008, 0.0)).g;
     outColor.b = sampleAt(v_texcoord - vec2(0.012, 0.0)).b;
+  } else if (u_badgl == 14) {
+    // dither: 1-bit ordered dithering, luminance thresholded against the
+    // Bayer matrix so the glyph breaks into a black/white stipple
+    float lum = dot(outColor.rgb, vec3(0.299, 0.587, 0.114));
+    outColor.rgb = vec3(step(ditherThreshold(gl_FragCoord.xy), lum));
+  } else if (u_badgl == 15) {
+    // bayer: colour ordered dither, each channel quantised to 4 levels with
+    // the threshold nudging the rounding so the banding stipples instead
+    float d = ditherThreshold(gl_FragCoord.xy) - 0.5;
+    outColor.rgb = clamp(floor(outColor.rgb * 3.0 + 0.5 + d), 0.0, 3.0) / 3.0;
   }
 }`);
 }
@@ -211,6 +238,8 @@ function shaderModeValue(name: string | undefined): number {
     case 'mosaic': return 11;
     case 'echo': return 12;
     case 'bleed': return 13;
+    case 'dither': return 14;
+    case 'bayer': return 15;
     default: return 0;
   }
 }
