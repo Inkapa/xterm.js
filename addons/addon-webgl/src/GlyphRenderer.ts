@@ -49,6 +49,10 @@ uniform vec2 u_resolution;
 uniform highp int u_vtx;
 uniform highp float u_vtime;
 uniform highp float u_intensity;
+// Per-effect character knobs, each a multiplier defaulting to 1.0 (the
+// built-in look). Slot 0 (warp) scales the vertex distortion here; the
+// fragment stage reads the rest. See paramValues for the slot mapping.
+uniform highp float u_param[4];
 
 out vec2 v_texcoord;
 flat out int v_texpage;
@@ -91,8 +95,11 @@ void main() {
   vec2 zeroToOne = (a_offset / u_resolution) + a_cellpos + (a_unitquad * a_size);
   vec4 base = u_projection * vec4(zeroToOne, 0.0, 1.0);
   // u_intensity (0..1) scales the warp: 0 leaves the frame undistorted, 1
-  // is the full warp, so a tween fades the distortion in and out.
-  gl_Position = mix(base, warpVertex(base), u_intensity);
+  // is the full warp, so a tween fades the distortion in and out. u_param[0]
+  // (warp) scales the displacement itself, so a driver can push the amount
+  // past the built-in look or flatten one warp without touching the master.
+  vec4 warped = warpVertex(base);
+  gl_Position = mix(base, base + (warped - base) * u_param[0], u_intensity);
   v_texpage = int(a_texpage);
   v_texcoord = a_texcoord + a_unitquad * a_texsize;
 }`;
@@ -113,6 +120,10 @@ uniform highp int u_badgl;
 uniform highp float u_time;
 uniform highp vec2 u_resolution;
 uniform highp float u_intensity;
+// Per-effect character knobs (see paramValues): [1] chroma spread, [2] echo
+// gain, [3] dither level count. Each multiplies one effect's built-in
+// constant and defaults to 1.0, so a driver shapes a single filter.
+uniform highp float u_param[4];
 
 out vec4 outColor;
 
@@ -193,7 +204,7 @@ void main() {
   }
   if ((u_badgl & 128) != 0) {
     // chroma: channel separation, like an untuned CRT
-    vec2 off = vec2(sin(u_time * 5.0) * 0.004, cos(u_time * 3.7) * 0.003);
+    vec2 off = vec2(sin(u_time * 5.0) * 0.004, cos(u_time * 3.7) * 0.003) * u_param[1];
     outColor.r = sampleAt(v_texcoord - off).r;
     outColor.b = sampleAt(v_texcoord + off).b;
   }
@@ -216,13 +227,14 @@ void main() {
   }
   if ((u_badgl & 2048) != 0) {
     // echo: a ghost of the glyph, offset and added, a smeared trail
-    outColor.rgb += sampleAt(v_texcoord - vec2(0.01, 0.0)).rgb * 0.6;
+    outColor.rgb += sampleAt(v_texcoord - vec2(0.01, 0.0)).rgb * 0.6 * u_param[2];
   }
   if ((u_badgl & 4096) != 0) {
-    // bleed: horizontal RGB smear, the channels run to the right
-    outColor.r = sampleAt(v_texcoord - vec2(0.004, 0.0)).r;
-    outColor.g = sampleAt(v_texcoord - vec2(0.008, 0.0)).g;
-    outColor.b = sampleAt(v_texcoord - vec2(0.012, 0.0)).b;
+    // bleed: horizontal RGB smear, the channels run to the right. Shares the
+    // chroma knob (u_param[1]) since both spread the colour channels.
+    outColor.r = sampleAt(v_texcoord - vec2(0.004, 0.0) * u_param[1]).r;
+    outColor.g = sampleAt(v_texcoord - vec2(0.008, 0.0) * u_param[1]).g;
+    outColor.b = sampleAt(v_texcoord - vec2(0.012, 0.0) * u_param[1]).b;
   }
   if ((u_badgl & 8192) != 0) {
     // dither: 1-bit ordered dithering, luminance thresholded against the
@@ -231,10 +243,12 @@ void main() {
     outColor.rgb = vec3(step(ditherThreshold(gl_FragCoord.xy), lum));
   }
   if ((u_badgl & 16384) != 0) {
-    // bayer: colour ordered dither, each channel quantised to 4 levels with
-    // the threshold nudging the rounding so the banding stipples instead
+    // bayer: colour ordered dither, each channel quantised with the threshold
+    // nudging the rounding so the banding stipples instead. u_param[3] scales
+    // the step count (default 3 -> 4 levels): higher is finer, lower coarser.
+    float steps = max(1.0, 3.0 * u_param[3]);
     float d = ditherThreshold(gl_FragCoord.xy) - 0.5;
-    outColor.rgb = clamp(floor(outColor.rgb * 3.0 + 0.5 + d), 0.0, 3.0) / 3.0;
+    outColor.rgb = clamp(floor(outColor.rgb * steps + 0.5 + d), 0.0, steps) / steps;
   }
 
   // Master crossfade: scale the whole filtered result back toward the
@@ -323,6 +337,26 @@ export function intensityValue(): number {
   return v < 0 ? 0 : (v > 1 ? 1 : v);
 }
 
+// paramValues fills the shared u_param[] array from the page's params bag.
+// Each slot is a per-effect multiplier on that effect's built-in constant and
+// defaults to 1.0 (the stock look) when unset, so a tween or a reactive driver
+// can shape one effect's character rather than only the master fade. The slots
+// are fixed and mirror the shader: 0 warp (vertex distortion amount), 1 chroma
+// (RGB-split spread, shared by chroma and bleed), 2 echo (ghost gain), 3
+// dither (bayer level count). Exported so both renderers set the same values
+// and the foreground and background stay in step. Reuses one array to avoid a
+// per-frame allocation, matching the work-variable idiom above.
+const PARAM_KEYS = ['warp', 'chroma', 'echo', 'dither'];
+const $paramArray = new Float32Array(PARAM_KEYS.length);
+export function paramValues(): Float32Array {
+  const p = glyphCfg().params || {};
+  for (let i = 0; i < PARAM_KEYS.length; i++) {
+    const v = p[PARAM_KEYS[i]];
+    $paramArray[i] = typeof v === 'number' ? v : 1.0;
+  }
+  return $paramArray;
+}
+
 export class GlyphRenderer extends Disposable {
   private readonly _program: WebGLProgram;
   private readonly _vertexArrayObject: IWebGLVertexArrayObject;
@@ -335,6 +369,7 @@ export class GlyphRenderer extends Disposable {
   private readonly _vtxLocation: WebGLUniformLocation;
   private readonly _vtimeLocation: WebGLUniformLocation;
   private readonly _intensityLocation: WebGLUniformLocation;
+  private readonly _paramLocation: WebGLUniformLocation;
   private readonly _atlasTextures: GLTexture[];
   private readonly _attributesBuffer: WebGLBuffer;
 
@@ -382,6 +417,9 @@ export class GlyphRenderer extends Disposable {
     // u_intensity is declared in both stages of this program, so it links to
     // one shared location that the vertex and fragment shaders both read.
     this._intensityLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_intensity'));
+    // u_param[] is declared in both stages and links to one shared location;
+    // query the first element for portability across drivers.
+    this._paramLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_param[0]'));
 
     // Create and set the vertex array object
     this._vertexArrayObject = gl.createVertexArray();
@@ -753,6 +791,7 @@ export class GlyphRenderer extends Disposable {
     gl.uniform1i(this._vtxLocation, vtxModeValue(glyphCfg().vtx));
     gl.uniform1f(this._vtimeLocation, this._frameCount);
     gl.uniform1f(this._intensityLocation, intensityValue());
+    gl.uniform1fv(this._paramLocation, paramValues());
     this._frameCount++;
 
     // Alternate buffers each frame as the active buffer gets locked while it's in use by the GPU

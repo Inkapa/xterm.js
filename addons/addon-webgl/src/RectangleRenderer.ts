@@ -52,7 +52,7 @@ import { Terminal } from '@xterm/xterm';
 import { RENDER_MODEL_BG_OFFSET, RENDER_MODEL_FG_OFFSET, RENDER_MODEL_INDICIES_PER_CELL } from './RenderModel';
 import { IRenderModel, IWebGL2RenderingContext, IWebGLVertexArrayObject } from './Types';
 import { createProgram, expandFloat32Array, PROJECTION_MATRIX } from './WebglUtils';
-import { vtxModeValue, intensityValue } from './GlyphRenderer';
+import { vtxModeValue, intensityValue, paramValues } from './GlyphRenderer';
 
 const enum VertexAttribLocations {
   POSITION = 0,
@@ -71,6 +71,9 @@ uniform mat4 u_projection;
 uniform highp int u_vtx;
 uniform highp float u_vtime;
 uniform highp float u_intensity;
+// Per-effect knobs, matching the glyph renderer. Slot 0 (warp) scales the
+// distortion so the background warp amount tracks the foreground.
+uniform highp float u_param[4];
 
 out vec4 v_color;
 
@@ -102,8 +105,9 @@ void main() {
   vec2 zeroToOne = a_position + (a_unitquad * a_size);
   vec4 base = u_projection * vec4(zeroToOne, 0.0, 1.0);
   // Scale the warp by u_intensity, matching the glyph renderer so the
-  // background and foreground fade together.
-  gl_Position = mix(base, warpVertex(base), u_intensity);
+  // background and foreground fade together; u_param[0] scales the amount.
+  vec4 warped = warpVertex(base);
+  gl_Position = mix(base, base + (warped - base) * u_param[0], u_intensity);
   v_color = a_color;
 }`;
 
@@ -119,6 +123,9 @@ uniform highp vec2 u_resolution;
 out vec4 outColor;
 
 uniform highp float u_intensity;
+// Per-effect knobs (see paramValues); the background reads slot 3 (dither) to
+// keep its bayer level count in step with the foreground.
+uniform highp float u_param[4];
 
 // 4x4 Bayer ordered-dither threshold matrix (kept in sync with the glyph
 // renderer). Ordered dithering is the single-pass, O(1)-per-fragment
@@ -204,10 +211,12 @@ void main() {
     outColor.rgb = vec3(step(ditherThreshold(gl_FragCoord.xy), lum));
   }
   if ((u_badgl & 2048) != 0) {
-    // bayer: colour ordered dither, 4 levels per channel, so the field
-    // posterises into stippled bands instead of smooth gradients
+    // bayer: colour ordered dither, so the field posterises into stippled
+    // bands instead of smooth gradients. u_param[3] scales the step count
+    // (default 3 -> 4 levels), matching the glyph renderer.
+    float steps = max(1.0, 3.0 * u_param[3]);
     float d = ditherThreshold(gl_FragCoord.xy) - 0.5;
-    outColor.rgb = clamp(floor(outColor.rgb * 3.0 + 0.5 + d), 0.0, 3.0) / 3.0;
+    outColor.rgb = clamp(floor(outColor.rgb * steps + 0.5 + d), 0.0, steps) / steps;
   }
 
   // Master crossfade back toward the plain background by u_intensity.
@@ -250,6 +259,7 @@ export class RectangleRenderer extends Disposable {
   private _vtxLocation: WebGLUniformLocation;
   private _vtimeLocation: WebGLUniformLocation;
   private _intensityLocation: WebGLUniformLocation;
+  private _paramLocation: WebGLUniformLocation;
   private _frameCount: number = 0;
   private _bgFloat!: Float32Array;
   private _cursorFloat!: Float32Array;
@@ -278,6 +288,7 @@ export class RectangleRenderer extends Disposable {
     this._vtxLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_vtx'));
     this._vtimeLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_vtime'));
     this._intensityLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_intensity'));
+    this._paramLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_param[0]'));
 
     // Create and set the vertex array object
     this._vertexArrayObject = gl.createVertexArray();
@@ -343,6 +354,7 @@ export class RectangleRenderer extends Disposable {
     gl.uniform1i(this._vtxLocation, vtxModeValue(glyphCfg().vtx));
     gl.uniform1f(this._vtimeLocation, this._frameCount);
     gl.uniform1f(this._intensityLocation, intensityValue());
+    gl.uniform1fv(this._paramLocation, paramValues());
     this._frameCount++;
     gl.uniform2f(this._fragResolutionLocation, gl.canvas.width, gl.canvas.height);
 
