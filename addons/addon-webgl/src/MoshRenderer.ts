@@ -29,12 +29,15 @@ function moshModeValue(name: string | undefined): number {
 }
 
 // How much of the previous composite survives into the next frame, before the
-// master intensity and the mosh knob scale it. The frame is added on top
-// rather than crossfaded, so the trails keep their brightness and the live
-// text stays legible; the price is that the sum saturates, which is what caps
-// this at well under 1.
+// master intensity and the mosh knob scale it. In the default 'add' blend the
+// frame is added on top, so the trails keep their brightness and the live text
+// stays legible at the cost of saturating bright areas, which is what caps
+// this well under 1. The 'fade' blend crossfades instead and does not
+// saturate, so it can hold a longer tail.
 const DECAY = 0.6;
 const DECAY_MAX = 0.92;
+const DECAY_FADE = 0.75;
+const DECAY_FADE_MAX = 0.97;
 
 // The fullscreen quad is generated from gl_VertexID, so the pass owns no
 // vertex buffer: an empty vertex array object is enough to keep the other
@@ -53,8 +56,10 @@ precision lowp float;
 in vec2 v_uv;
 
 uniform sampler2D u_history;
-// u_mode picks how the history is displaced before it is drawn back.
+// u_mode picks how the history is displaced before it is drawn back,
+// u_shift scales that displacement (window.glyph.params.moshShift).
 uniform int u_mode;
+uniform highp float u_shift;
 
 out vec4 outColor;
 
@@ -64,13 +69,13 @@ void main() {
   // simply dimming in place. 'trail' leaves it in place for a plain decay.
   vec2 uv = v_uv;
   if (u_mode == 2) {
-    uv.x -= 0.0025;
+    uv.x -= 0.0025 * u_shift;
   } else if (u_mode == 3) {
-    uv.y -= 0.0025;
+    uv.y -= 0.0025 * u_shift;
   } else if (u_mode == 4) {
-    uv = (uv - 0.5) * 0.996 + 0.5;
+    uv = (uv - 0.5) * (1.0 - 0.004 * u_shift) + 0.5;
   } else if (u_mode == 5) {
-    uv = (uv - 0.5) * 1.004 + 0.5;
+    uv = (uv - 0.5) * (1.0 + 0.004 * u_shift) + 0.5;
   }
   outColor = texture(u_history, uv);
 }`;
@@ -93,6 +98,7 @@ export class MoshRenderer extends Disposable {
   private _texture: WebGLTexture;
   private _historyLocation: WebGLUniformLocation;
   private _modeLocation: WebGLUniformLocation;
+  private _shiftLocation: WebGLUniformLocation;
   // The atlas claims texture units 0..maxAtlasPages-1 and only rebinds a page
   // when its version changes, so a unit borrowed from that range would leave a
   // stale binding behind. Take the last unit instead, which it never reaches.
@@ -116,6 +122,7 @@ export class MoshRenderer extends Disposable {
 
     this._historyLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_history'));
     this._modeLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_mode'));
+    this._shiftLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_shift'));
 
     this._vertexArrayObject = throwIfFalsy(gl.createVertexArray());
 
@@ -160,12 +167,19 @@ export class MoshRenderer extends Disposable {
       gl.bindVertexArray(this._vertexArrayObject);
       gl.uniform1i(this._historyLocation, this._unit);
       gl.uniform1i(this._modeLocation, mode);
-      // dst = history * decay + frame. The decay rides in as the blend
-      // constant, which keeps the whole feedback loop to one draw: no second
-      // framebuffer to read the destination from.
-      const decay = Math.min(DECAY * decayScale() * intensityValue(), DECAY_MAX);
+      gl.uniform1f(this._shiftLocation, paramScale('moshShift'));
+      // The decay rides in as the blend constant, which keeps the whole
+      // feedback loop to one draw: no second framebuffer to read the
+      // destination from. 'add' sums the frame onto the decayed history
+      // (dst = history * decay + frame), 'fade' crossfades the two
+      // (dst = history * decay + frame * (1 - decay)), the only two mixes one
+      // blend constant can express.
+      const fade = glyphCfg().moshBlend === 'fade';
+      const base = fade ? DECAY_FADE : DECAY;
+      const cap = fade ? DECAY_FADE_MAX : DECAY_MAX;
+      const decay = Math.min(base * paramScale('mosh') * intensityValue(), cap);
       gl.blendColor(decay, decay, decay, decay);
-      gl.blendFunc(gl.CONSTANT_COLOR, gl.ONE);
+      gl.blendFunc(gl.CONSTANT_COLOR, fade ? gl.ONE_MINUS_CONSTANT_COLOR : gl.ONE);
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
       // The other renderers set the blend mode once at startup and never
       // touch it again, so this pass has to put it back.
@@ -177,12 +191,12 @@ export class MoshRenderer extends Disposable {
   }
 }
 
-// decayScale reads the feedback multiplier from the page's params bag, on the
-// same footing as the u_param[] slots: 1.0 is the built-in look, higher values
-// hold the trails longer. It is a params entry rather than a u_param slot
-// because the decay never reaches the shader, it is the blend constant.
-function decayScale(): number {
-  const p = glyphCfg().params || {};
-  const v = p.mosh;
+// paramScale reads one of this pass's multipliers from the page's params bag,
+// on the same footing as the u_param[] slots: 1.0 is the built-in look. 'mosh'
+// holds the trails longer, 'moshShift' widens the displacement. They are plain
+// params entries rather than u_param slots because that array is shared with
+// the glyph and rectangle programs, which have no use for either value.
+function paramScale(key: string): number {
+  const v = (glyphCfg().params || {})[key];
   return typeof v === 'number' ? Math.max(v, 0) : 1.0;
 }
