@@ -21,6 +21,7 @@ import { Attributes, Content, NULL_CELL_CHAR, NULL_CELL_CODE } from 'common/buff
 import { ICoreService, IDecorationService, IOptionsService } from 'common/services/Services';
 import { Terminal } from '@xterm/xterm';
 import { GlyphRenderer } from './GlyphRenderer';
+import { MoshRenderer } from './MoshRenderer';
 import { RectangleRenderer } from './RectangleRenderer';
 import { COMBINED_CHAR_BIT_MASK, RENDER_MODEL_BG_OFFSET, RENDER_MODEL_EXT_OFFSET, RENDER_MODEL_FG_OFFSET, RENDER_MODEL_INDICIES_PER_CELL, RenderModel } from './RenderModel';
 import { IWebGL2RenderingContext } from './Types';
@@ -44,6 +45,7 @@ export class WebglRenderer extends Disposable implements IRenderer {
   private _gl: IWebGL2RenderingContext;
   private _rectangleRenderer: MutableDisposable<RectangleRenderer> = this.register(new MutableDisposable());
   private _glyphRenderer: MutableDisposable<GlyphRenderer> = this.register(new MutableDisposable());
+  private _moshRenderer: MutableDisposable<MoshRenderer> = this.register(new MutableDisposable());
 
   public readonly dimensions: IRenderDimensions;
 
@@ -247,6 +249,7 @@ export class WebglRenderer extends Disposable implements IRenderer {
   private _initializeWebGLState(): [RectangleRenderer, GlyphRenderer] {
     this._rectangleRenderer.value = new RectangleRenderer(this._terminal, this._gl, this.dimensions, this._themeService);
     this._glyphRenderer.value = new GlyphRenderer(this._terminal, this._gl, this.dimensions, this._optionsService);
+    this._moshRenderer.value = new MoshRenderer(this._gl);
 
     // Update dimensions and acquire char atlas
     this.handleCharSizeChanged();
@@ -359,6 +362,8 @@ export class WebglRenderer extends Disposable implements IRenderer {
     if (!this._cursorBlinkStateManager.value || this._cursorBlinkStateManager.value.isCursorVisible) {
       this._rectangleRenderer.value.renderCursor();
     }
+    // Feedback last: it folds the finished frame into the trails it keeps.
+    this._moshRenderer.value?.render();
   }
 
   private _updateCursorBlink(): void {
