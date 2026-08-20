@@ -145,6 +145,11 @@ export class Viewport extends Disposable implements IViewport {
    * Updates dimensions and synchronizes the scroll area if necessary.
    */
   public syncScrollArea(immediate: boolean = false): void {
+    // A sync before a renderer exists touches helper elements that are not
+    // there yet and throws; the page can ask before the first open.
+    if (!this._renderService.hasRenderer()) {
+      return;
+    }
     // If buffer height changed
     if (this._lastRecordedBufferLength !== this._bufferService.buffer.lines.length) {
       this._lastRecordedBufferLength = this._bufferService.buffer.lines.length;

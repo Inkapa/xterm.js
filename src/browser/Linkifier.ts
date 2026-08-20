@@ -22,6 +22,7 @@ export class Linkifier extends Disposable implements ILinkifier2 {
   private _wasResized: boolean = false;
   private _activeProviderReplies: Map<Number, ILinkWithState[] | undefined> | undefined;
   private _activeLine: number = -1;
+  private _linkYdisp: number = -1;
 
   private readonly _onShowLinkUnderline = this.register(new EventEmitter<ILinkifierEvent>());
   public readonly onShowLinkUnderline = this._onShowLinkUnderline.event;
@@ -248,6 +249,7 @@ export class Linkifier extends Disposable implements ILinkifier2 {
     if (!this._lastMouseEvent) {
       return;
     }
+    this._linkYdisp = this._bufferService.buffer.ydisp;
 
     const position = this._positionFromMouseEvent(this._lastMouseEvent, this._element, this._mouseService);
 
@@ -299,6 +301,14 @@ export class Linkifier extends Disposable implements ILinkifier2 {
       this._linkCacheDisposables.push(this._renderService.onRenderedViewportChange(e => {
         // Sanity check, this shouldn't happen in practice as this listener would be disposed
         if (!this._currentLink) {
+          return;
+        }
+        // A full-screen repaint reports start 0 on every frame of an animated
+        // app (sshello's fields repaint the whole viewport continuously),
+        // which would clear any hovered link and make clicks never activate.
+        // Repaints do not move buffer rows; only a scroll changes ydisp, and
+        // that still clears below.
+        if (this._bufferService.buffer.ydisp === this._linkYdisp) {
           return;
         }
         // When start is 0 a scroll most likely occurred, make sure links above the fold also get
