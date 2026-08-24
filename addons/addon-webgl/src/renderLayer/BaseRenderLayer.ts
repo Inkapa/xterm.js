@@ -53,10 +53,7 @@ export abstract class BaseRenderLayer extends Disposable implements IRenderLayer
   }
 
   private _initCanvas(): void {
-    // colorSpace pinned to sRGB, same reasoning as the WebGL context in
-    // WebglRenderer.ts: an unpinned canvas can be promoted to a wider gamut
-    // when composited onto an HDR display, which bands flat fills.
-    this._ctx = throwIfFalsy(this._canvas.getContext('2d', { alpha: this._alpha, colorSpace: 'srgb' }));
+    this._ctx = throwIfFalsy(this._canvas.getContext('2d', { alpha: this._alpha }));
     // Draw the background if this is an opaque layer
     if (!this._alpha) {
       this._clearAll();
