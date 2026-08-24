@@ -379,21 +379,7 @@ export class GlyphRenderer extends Disposable {
     let bufferLength = 0;
     for (let y = 0; y < renderModel.lineLengths.length; y++) {
       const si = y * this._terminal.cols * INDICES_PER_CELL;
-      if (si >= this._vertices.attributes.length) {
-        // The render model is a row ahead of clear()'s last resize (a
-        // pending resize hasn't reached this buffer yet): nothing left to
-        // read for this row or any past it.
-        break;
-      }
-      // Clamp to a whole number of cells. Reading past the buffer's own
-      // resize is otherwise silently truncated by subarray to whatever is
-      // left, which is not guaranteed to be a multiple of INDICES_PER_CELL:
-      // the resulting bufferLength / INDICES_PER_CELL below is then
-      // fractional, and drawElementsInstanced ends up requesting one more
-      // instance than the uploaded buffer actually holds.
-      const end = Math.min(si + renderModel.lineLengths[y] * INDICES_PER_CELL, this._vertices.attributes.length);
-      const wholeCellsEnd = si + Math.floor((end - si) / INDICES_PER_CELL) * INDICES_PER_CELL;
-      const sub = this._vertices.attributes.subarray(si, wholeCellsEnd);
+      const sub = this._vertices.attributes.subarray(si, si + renderModel.lineLengths[y] * INDICES_PER_CELL);
       activeBuffer.set(sub, bufferLength);
       bufferLength += sub.length;
     }
