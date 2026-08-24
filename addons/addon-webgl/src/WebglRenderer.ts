@@ -95,12 +95,7 @@ export class WebglRenderer extends Disposable implements IRenderer {
     const contextAttributes = {
       antialias: false,
       depth: false,
-      preserveDrawingBuffer,
-      // Pin the drawing buffer to sRGB. Left unset, a browser compositing
-      // onto a wide-gamut/HDR display can promote the swap chain to a wider
-      // color space, which shows up as banding on flat colour fills like the
-      // half-block art this renderer draws.
-      colorSpace: 'srgb'
+      preserveDrawingBuffer
     };
     this._gl = this._canvas.getContext('webgl2', contextAttributes) as IWebGL2RenderingContext;
     if (!this._gl) {
