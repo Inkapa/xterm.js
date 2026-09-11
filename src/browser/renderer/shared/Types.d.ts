@@ -108,6 +108,8 @@ export interface ITextureAtlas extends IDisposable {
    */
   clearTexture(): void;
   getRasterizedGlyph(code: number, bg: number, fg: number, ext: number, restrictToCellHeight: boolean): IRasterizedGlyph;
+  /** Whether getRasterizedGlyph would be a cache hit, without drawing anything. */
+  hasRasterizedGlyph(code: number, bg: number, fg: number, ext: number): boolean;
   getRasterizedGlyphCombinedChar(chars: string, bg: number, fg: number, ext: number, restrictToCellHeight: boolean): IRasterizedGlyph;
 }
 

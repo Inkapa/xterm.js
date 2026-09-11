@@ -326,6 +326,34 @@ function glyphCfg(): any {
   return (typeof globalThis !== 'undefined' && (globalThis as any).glyph) || {};
 }
 
+// The page's shared per-cell module (glyph's renderers/percell, built to
+// WebAssembly), present once the page has loaded it.
+export interface IPercellModule {
+  active: boolean;
+  geometry(cols: number, rows: number, frame: number): Float32Array;
+  substitute(code: number, dc: number, dr: number): number;
+}
+
+// percellModule returns the module while a per-cell mode is on, and
+// undefined otherwise: before the page loads it, in tests, and whenever
+// every per-cell amount is zero.
+export function percellModule(): IPercellModule | undefined {
+  const module = glyphCfg().percell as IPercellModule | undefined;
+  return module && module.active ? module : undefined;
+}
+
+// Channel layout of IPercellModule.geometry, channel-major, one run of
+// cols*rows floats per channel. Matches glyph's cell::CellGeometry::channels.
+const enum PercellChannel { DX, DY, W_SCALE, H_SCALE, DC, DR, MIRROR_X, MIRROR_Y, ACTIVE, COUNT }
+
+// New glyphs the index modes may rasterize into the atlas per 60 Hz frame's
+// worth of time. Unbudgeted substitution at a 211x49 grid measured over 80%
+// of the main thread; this bounds it, and the atlas fills up over a few
+// frames on steady colours. It refills by elapsed time rather than per
+// frame, so a 144 Hz display rasterizes no more per second than a 60 Hz one.
+const SUBSTITUTION_BUDGET = 64;
+const SUBSTITUTION_REFILL_MS = 1000 / 60;
+
 // intensityValue reads the master glitch intensity (0..1) from the page's
 // params bag, clamped. It scales the continuous stages (the vertex warp and
 // the fragment filters) so a tween or a reactive driver can fade the whole
@@ -376,6 +404,15 @@ export class GlyphRenderer extends Disposable {
   private _atlas: ITextureAtlas | undefined;
   private _activeBuffer: number = 0;
   private _frameCount: number = 0;
+  private _percell: IPercellModule | undefined;
+  private _percellGeometry: Float32Array | undefined;
+  private _substitutionBudget: number = 0;
+  private _substitutionRefilledAt: number = 0;
+  // Cells whose substitute was not in the atlas, counted this frame, and
+  // the admission stride worked out from last frame's count.
+  private _substitutionMisses: number = 0;
+  private _substitutionStride: number = 1;
+  private _percellFrame: number = 0;
   private readonly _vertices: IVertices = {
     count: 0,
     attributes: new Float32Array(0),
@@ -498,6 +535,22 @@ export class GlyphRenderer extends Disposable {
   }
 
   public beginFrame(): boolean {
+    // One call into the shared core per frame for the whole grid. The
+    // frame is wall-clock 60 Hz, which is the rate native and
+    // TouchDesigner step at; a render count would run faster whenever the
+    // door triggers extra renders.
+    this._percell = percellModule();
+    const now = performance.now();
+    this._percellFrame = Math.floor(now / (1000 / 60));
+    this._percellGeometry = this._percell?.geometry(this._terminal.cols, this._terminal.rows, this._percellFrame);
+    this._substitutionBudget = Math.min(SUBSTITUTION_BUDGET, this._substitutionBudget + (now - this._substitutionRefilledAt) / SUBSTITUTION_REFILL_MS * SUBSTITUTION_BUDGET);
+    this._substitutionRefilledAt = now;
+    // Cells update in scan order, so a budget spent first come first
+    // served would all go to the top rows. Admit roughly one miss in
+    // `stride` instead, picked by a hash that moves every frame, so the
+    // budget lands across the whole grid.
+    this._substitutionStride = Math.max(1, Math.ceil(this._substitutionMisses / SUBSTITUTION_BUDGET));
+    this._substitutionMisses = 0;
     return this._atlas ? this._atlas.beginFrame() : true;
   }
 
@@ -521,6 +574,40 @@ export class GlyphRenderer extends Disposable {
 
     if (!this._atlas) {
       return;
+    }
+
+    // Shared per-cell geometry, computed for the whole grid in beginFrame.
+    // A stale buffer from before a resize is ignored for that frame.
+    const samples = this._terminal.cols * this._terminal.rows;
+    const geometry = this._percellGeometry && this._percellGeometry.length === PercellChannel.COUNT * samples ? this._percellGeometry : undefined;
+    const sample = y * this._terminal.cols + x;
+    if (geometry) {
+      if (geometry[PercellChannel.ACTIVE * samples + sample] === 0) {
+        array.fill(0, $i, $i + INDICES_PER_CELL - 1 - CELL_POSITION_INDICES);
+        return;
+      }
+      // Index modes draw a nearby but wrong glyph. That has to happen
+      // before the atlas lookup, so the substitute is what gets drawn.
+      const dc = geometry[PercellChannel.DC * samples + sample];
+      const dr = geometry[PercellChannel.DR * samples + sample];
+      if ((dc !== 0 || dr !== 0) && width === 1 && !(chars && chars.length > 1)) {
+        // The atlas keys glyphs by colour, and the shared core re-rolls
+        // substitutions every frame, so unbounded substitution rasterizes
+        // new glyphs every frame. Substitutes already in the atlas are
+        // free; new ones spend a budget spread across the grid, and a cell
+        // that misses out keeps its own glyph this frame.
+        const substitute = this._percell!.substitute(code, dc, dr);
+        if (this._atlas.hasRasterizedGlyph(substitute, bg, fg, ext)) {
+          code = substitute;
+        } else {
+          this._substitutionMisses++;
+          const admitted = ((Math.imul(sample, 0x9e3779b1) ^ Math.imul(this._percellFrame, 0x85ebca6b)) >>> 0) % this._substitutionStride === 0;
+          if (admitted && this._substitutionBudget > 0) {
+            this._substitutionBudget--;
+            code = substitute;
+          }
+        }
+      }
     }
 
     // Get the glyph
@@ -580,159 +667,29 @@ export class GlyphRenderer extends Disposable {
       }
     }
 
-    // glyph bad-GL modes (window.glyph.badgl): deliberate renderer
-    // corruption, read live per cell. No atlas or shader state is
-    // touched, so the modes cannot break the page arrays.
-    const g = glyphCfg();
-    const hm = (x * 73856093) ^ (y * 19349663) ^ (bg >>> 13) ^ (fg >>> 7);
-    const hA = (hm & 0xFFFF) / 0xFFFF;
-    const hB = ((hm >>> 16) & 0xFFFF) / 0xFFFF;
-    const cw = this._dimensions.device.char.width;
-    const ch = this._dimensions.device.char.height;
-    let mode = g.badgl;
-    if (mode === 'mix') {
-      mode = ['jitter', 'page', 'tex', 'cut', 'stretch', 'shift', 'flip', 'skip', 'zebra', 'block', 'band', 'drift', 'wobble', 'squint', 'snow', 'melt', 'tear', 'throb', 'explode', 'spike', 'crush'][Math.floor(hA * 21)];
+    if (geometry) {
+      // The shared core works in font pixels of an 8x16 cell; scale to
+      // this renderer's device cell so one amount looks the same at any
+      // font size or pixel ratio.
+      array[$i] += geometry[PercellChannel.DX * samples + sample] * this._dimensions.device.cell.width / 8;
+      array[$i + 1] += geometry[PercellChannel.DY * samples + sample] * this._dimensions.device.cell.height / 16;
+      array[$i + 2] *= geometry[PercellChannel.W_SCALE * samples + sample];
+      array[$i + 3] *= geometry[PercellChannel.H_SCALE * samples + sample];
+      // Mirror by negating the texture span from the opposite edge.
+      if (geometry[PercellChannel.MIRROR_X * samples + sample] !== 0) {
+        array[$i + 5] += array[$i + 7];
+        array[$i + 7] = -array[$i + 7];
+      }
+      if (geometry[PercellChannel.MIRROR_Y * samples + sample] !== 0) {
+        array[$i + 6] += array[$i + 8];
+        array[$i + 8] = -array[$i + 8];
+      }
     }
-    switch (mode) {
-      case 'jitter':
-        array[$i] += (hA - 0.5) * 2 * cw * 2;
-        array[$i + 1] += (hB - 0.5) * 2 * ch * 2;
-        break;
-      case 'page':
-        // Draw each cell from the next atlas page, clamped to the bound
-        // sampler array: an index past it samples an unbound texture and
-        // renders black.
-        array[$i + 4] = (array[$i + 4] + 1) % Math.max(1, Math.min(this._atlas.pages.length, this._atlasTextures.length));
-        break;
-      case 'tex':
-        array[$i + 5] += (hA - 0.5) * 0.5;
-        array[$i + 6] += (hB - 0.5) * 0.5;
-        break;
-      case 'cut':
-        // half-cut characters: the quad is clipped top or bottom
-        if (hA < 0.5) {
-          array[$i + 3] *= 0.5;
-        } else {
-          array[$i + 1] += ch / 2;
-          array[$i + 3] *= 0.5;
-        }
-        break;
-      case 'stretch':
-        array[$i + 2] *= 0.6 + 1.4 * hA;
-        array[$i + 3] *= 0.6 + 0.8 * hB;
-        break;
-      case 'shift':
-        // glyphs sit between cells and get cut at the cell edges
-        array[$i] += cw * (hA < 0.5 ? -0.5 : 0.5);
-        array[$i + 1] += ch * (hB < 0.5 ? -0.5 : 0.5);
-        break;
-      case 'flip':
-        // mirrored glyphs: negative texture span with an offset base
-        if (hA < 0.5) {
-          array[$i + 5] += array[$i + 7];
-          array[$i + 7] = -array[$i + 7];
-        } else {
-          array[$i + 6] += array[$i + 8];
-          array[$i + 8] = -array[$i + 8];
-        }
-        break;
-      case 'skip':
-        // cells vanish: zero the vertex, the cell draws nothing
-        if (hA < 0.25) {
-          array.fill(0, $i, $i + INDICES_PER_CELL - 1 - CELL_POSITION_INDICES);
-          return;
-        }
-        break;
-      case 'zebra':
-        // checkerboard of wrong texture regions
-        if (((x + y) & 1) === 0) {
-          array[$i + 5] += 0.25 * (hA - 0.5);
-          array[$i + 6] += 0.25 * (hB - 0.5);
-        }
-        break;
-      case 'block':
-        // whole 2x2 blocks corrupt together
-        if ((((x >> 1) * 73856093) ^ ((y >> 1) * 19349663) ^ (bg >>> 13) ^ (fg >>> 7) & 0xFFFF) / 0xFFFF < 0.4) {
-          array[$i + 5] += 0.4 * (hA - 0.5);
-          array[$i + 6] += 0.4 * (hB - 0.5);
-        }
-        break;
-      case 'band':
-        // wobbling stripes of garbage, the band position per column
-        // shifts with the cell colours
-        if (((y + Math.floor(hB * 8)) % 8) < 3) {
-          array[$i + 5] += 0.6 * (hA - 0.5);
-        }
-        break;      case 'drift':
-        // sub-pixel offset drift: glyphs sit slightly off, fuzzy edges
-        array[$i] += (hA - 0.5) * cw * 0.25;
-        array[$i + 1] += (hB - 0.5) * ch * 0.25;
-        break;
-      case 'wobble':
-        // gentle per-column wave
-        array[$i] += Math.sin(y * 0.35 + hB * 6.28) * cw * 0.3;
-        break;
-      case 'squint':
-        // glyphs slightly compressed
-        array[$i + 3] *= 0.85;
-        break;
-      case 'snow':
-        // rare cells nudge slightly off their texture region
-        if (hA < 0.05) {
-          array[$i + 5] += (hB - 0.5) * 0.2;
-        }
-        break;
-      case 'melt':
-        // time-driven drip: each cell slides downward at a speed set by
-        // its hash and wraps after a few rows, so the screen runs like
-        // wet ink and the layout never settles.
-        array[$i + 1] += (this._frameCount * (0.4 + hA) * 2 + hB * ch * 8) % (ch * 8);
-        break;
-      case 'tear':
-        // horizontal tracking tear: whole rows jump sideways together,
-        // the shift per row wandering with time like a mistuned VHS head.
-        {
-          const t = Math.sin(y * 0.7 + this._frameCount * 0.08);
-          if (t > 0.6) {
-            array[$i] += (t - 0.6) * cw * 20;
-          }
-        }
-        break;
-      case 'throb':
-        // time-driven breathing: every cell pulses in size, overshooting
-        // 1 so glyphs swell over their neighbours and contract to nothing.
-        {
-          const p = 0.5 + 1.1 * (0.5 + 0.5 * Math.sin(this._frameCount * 0.15 + hA * 6.28));
-          array[$i + 2] *= p;
-          array[$i + 3] *= p;
-        }
-        break;
-      case 'explode':
-        // radial blast from the screen centre: glyphs fly outward, the
-        // far ones leaving the viewport entirely.
-        {
-          const dx = (x / this._terminal.cols) - 0.5;
-          const dy = (y / this._terminal.rows) - 0.5;
-          array[$i]     += dx * cw * (4 + hA * 12);
-          array[$i + 1] += dy * ch * (4 + hB * 12);
-        }
-        break;
-      case 'spike':
-        // rare cells detonate to many times their size: one stamp smeared
-        // across a whole region, overflowing its neighbours.
-        if (hA < 0.03) {
-          array[$i + 2] *= 6 + hB * 10;
-          array[$i + 3] *= 6 + hA * 10;
-        }
-        break;
-      case 'crush':
-        // random rows of cells collapse to a single scanline, a
-        // dying-CRT horizontal streak.
-        if (hB < 0.3) {
-          array[$i + 3] *= 0.06;
-          array[$i + 1] += ch * 0.5;
-        }
-        break;
+
+    // page is local to this renderer: only xterm's atlas has pages to draw
+    // the wrong one from. It stays out of the shared core.
+    if (glyphCfg().badgl === 'page') {
+      array[$i + 4] = (array[$i + 4] + 1) % Math.max(1, Math.min(this._atlas.pages.length, this._atlasTextures.length));
     }
   }
 
