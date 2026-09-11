@@ -613,11 +613,12 @@ export class GlyphRenderer extends Disposable {
       const dc = geometry[PercellChannel.DC * samples + sample];
       const dr = geometry[PercellChannel.DR * samples + sample];
       if ((dc !== 0 || dr !== 0) && width === 1 && !(chars && chars.length > 1)) {
-        // The atlas keys glyphs by colour, and the shared core re-rolls
-        // substitutions every frame, so unbounded substitution rasterizes
-        // new glyphs every frame. Substitutes already in the atlas are
-        // free; new ones spend a budget spread across the grid, and a cell
-        // that misses out keeps its own glyph this frame.
+        // With tint off the atlas keys glyphs by colour, and the shared core
+        // re-rolls substitutions every frame, so unbounded substitution
+        // rasterizes new glyphs every frame. Substitutes already in the
+        // atlas are free; new ones spend a budget spread across the grid,
+        // and a cell that misses out keeps its own glyph this frame. A
+        // tinted atlas holds each shape once, so the budget rarely binds.
         const substitute = this._percell!.substitute(code, dc, dr);
         if (this._atlas.hasRasterizedGlyph(substitute, bg, fg, ext)) {
           code = substitute;
