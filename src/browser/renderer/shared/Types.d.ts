@@ -111,6 +111,11 @@ export interface ITextureAtlas extends IDisposable {
   /** Whether getRasterizedGlyph would be a cache hit, without drawing anything. */
   hasRasterizedGlyph(code: number, bg: number, fg: number, ext: number): boolean;
   getRasterizedGlyphCombinedChar(chars: string, bg: number, fg: number, ext: number, restrictToCellHeight: boolean): IRasterizedGlyph;
+  /**
+   * The resolved foreground colour (packed 0xRRGGBBAA) for a cell, which the
+   * glyph renderer uses to tint a colour-independent glyph mask.
+   */
+  getFgColor(bg: number, fg: number, ext: number, code: number): number;
 }
 
 /**

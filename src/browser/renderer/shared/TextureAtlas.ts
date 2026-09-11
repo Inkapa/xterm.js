@@ -54,6 +54,21 @@ interface ICharAtlasActiveRow {
 // Work variables to avoid garbage collection
 let $glyph = undefined;
 
+// A tinted mask is drawn white on black and turned into coverage afterwards
+// (see maskFromCoverage), so its edges carry no background colour.
+const MASK_GROUND = channels.toColor(0, 0, 0);
+const MASK_INK = channels.toColor(255, 255, 255);
+const MASK_INK_DIM = `rgba(255, 255, 255, ${DIM_OPACITY})`;
+
+// The colour mode and value bits of a cell attribute. A tinted mask does not
+// depend on them, so they are left out of its cache key and a glyph caches
+// once per shape and style rather than once per colour.
+const COLOR_BITS = Attributes.CM_MASK | Attributes.RGB_MASK;
+
+function cacheKeyColor(attr: number): number {
+  return TextureAtlas.tintGlyphs ? attr & ~COLOR_BITS : attr;
+}
+
 export class TextureAtlas implements ITextureAtlas {
   private _didWarmUp: boolean = false;
 
@@ -78,6 +93,15 @@ export class TextureAtlas implements ITextureAtlas {
 
   public static maxAtlasPages: number | undefined;
   public static maxTextureSize: number | undefined;
+  /**
+   * Whether glyphs are stored as colour-independent coverage masks that the
+   * renderer tints per cell. With it on, one entry serves a glyph in every
+   * colour, so the atlas no longer grows with the number of distinct colours
+   * on screen. With it off, colour is baked into each entry, which is what
+   * lets a colour flood overflow the atlas. Read at cache time, so flip it
+   * and clear the atlas to switch.
+   */
+  public static tintGlyphs: boolean = true;
 
   private readonly _onAddTextureAtlasCanvas = new EventEmitter<HTMLCanvasElement>();
   public readonly onAddTextureAtlasCanvas = this._onAddTextureAtlasCanvas.event;
@@ -250,7 +274,34 @@ export class TextureAtlas implements ITextureAtlas {
   }
 
   public hasRasterizedGlyph(code: number, bg: number, fg: number, ext: number): boolean {
-    return this._cacheMap.get(code, bg, fg, ext) !== undefined;
+    return this._cacheMap.get(code, cacheKeyColor(bg), cacheKeyColor(fg), ext) !== undefined;
+  }
+
+  /**
+   * The foreground colour for a cell as packed 0xRRGGBBAA, resolved the way
+   * _drawToCache resolves it (inverse, bold-in-bright, minimum contrast)
+   * except for dim, which a mask carries as reduced opacity. The glyph
+   * renderer tints masks with it.
+   */
+  public getFgColor(bg: number, fg: number, ext: number, code: number): number {
+    this._workAttributeData.fg = fg;
+    this._workAttributeData.bg = bg;
+    this._workAttributeData.extended.ext = ext;
+    const inverse = !!this._workAttributeData.isInverse();
+    const bold = !!this._workAttributeData.isBold();
+    let fgColor = this._workAttributeData.getFgColor();
+    let fgColorMode = this._workAttributeData.getFgColorMode();
+    let bgColor = this._workAttributeData.getBgColor();
+    let bgColorMode = this._workAttributeData.getBgColorMode();
+    if (inverse) {
+      const temp = fgColor;
+      fgColor = bgColor;
+      bgColor = temp;
+      const temp2 = fgColorMode;
+      fgColorMode = bgColorMode;
+      bgColorMode = temp2;
+    }
+    return this._getForegroundColor(bg, bgColorMode, bgColor, fg, fgColorMode, fgColor, inverse, false, bold, treatGlyphAsBackgroundColor(code)).rgba;
   }
 
   /**
@@ -264,10 +315,12 @@ export class TextureAtlas implements ITextureAtlas {
     ext: number,
     restrictToCellHeight: boolean = false
   ): IRasterizedGlyph {
-    $glyph = cacheMap.get(key, bg, fg, ext);
+    const keyBg = cacheKeyColor(bg);
+    const keyFg = cacheKeyColor(fg);
+    $glyph = cacheMap.get(key, keyBg, keyFg, ext);
     if (!$glyph) {
       $glyph = this._drawToCache(key, bg, fg, ext, restrictToCellHeight);
-      cacheMap.set(key, bg, fg, ext, $glyph);
+      cacheMap.set(key, keyBg, keyFg, ext, $glyph);
     }
     return $glyph;
   }
@@ -475,8 +528,12 @@ export class TextureAtlas implements ITextureAtlas {
       bgColorMode = temp2;
     }
 
+    // A tinted mask is drawn white on black whatever the cell's colours;
+    // tintGlyphs is read once here so a mid-draw toggle cannot mix modes.
+    const tint = TextureAtlas.tintGlyphs;
+
     // draw the background
-    const backgroundColor = this._getBackgroundColor(bgColorMode, bgColor, inverse, dim);
+    const backgroundColor = tint ? MASK_GROUND : this._getBackgroundColor(bgColorMode, bgColor, inverse, dim);
     // Use a 'copy' composite operation to clear any existing glyph out of _tmpCtxWithAlpha,
     // regardless of transparency in backgroundColor
     this._tmpCtx.globalCompositeOperation = 'copy';
@@ -493,8 +550,11 @@ export class TextureAtlas implements ITextureAtlas {
 
     const powerlineGlyph = chars.length === 1 && isPowerlineGlyph(chars.charCodeAt(0));
     const restrictedPowerlineGlyph = chars.length === 1 && isRestrictedPowerlineGlyph(chars.charCodeAt(0));
-    const foregroundColor = this._getForegroundColor(bg, bgColorMode, bgColor, fg, fgColorMode, fgColor, inverse, dim, bold, treatGlyphAsBackgroundColor(chars.charCodeAt(0)));
-    this._tmpCtx.fillStyle = foregroundColor.css;
+    // A mask keeps dim as lower opacity, so it survives the tint. Custom
+    // underline colours do not: a mask is tinted with the foreground as a
+    // whole, underline included.
+    const foregroundColor = tint ? MASK_INK : this._getForegroundColor(bg, bgColorMode, bgColor, fg, fgColorMode, fgColor, inverse, dim, bold, treatGlyphAsBackgroundColor(chars.charCodeAt(0)));
+    this._tmpCtx.fillStyle = tint && dim ? MASK_INK_DIM : foregroundColor.css;
 
     // For powerline glyphs left/top padding is excluded (https://github.com/microsoft/vscode/issues/120129)
     const padding = restrictedPowerlineGlyph ? 0 : TMP_CANVAS_GLYPH_PADDING * 2;
@@ -725,7 +785,9 @@ export class TextureAtlas implements ITextureAtlas {
 
     // Clear out the background color and determine if the glyph is empty.
     let isEmpty: boolean;
-    if (!this._config.allowTransparency) {
+    if (tint) {
+      isEmpty = maskFromCoverage(imageData);
+    } else if (!this._config.allowTransparency) {
       isEmpty = clearColor(imageData, backgroundColor, foregroundColor, enableClearThresholdCheck);
     } else {
       isEmpty = checkCompletelyTransparent(imageData);
@@ -1039,6 +1101,29 @@ class AtlasPage {
     this.fixedRows.length = 0;
     this.version++;
   }
+}
+
+/**
+ * Turns a glyph drawn white on black into a white coverage mask: each pixel's
+ * brightness becomes its alpha. The renderer multiplies the mask by the cell's
+ * colour, so antialiased edges blend over whatever background ends up behind
+ * them instead of the one the glyph was first drawn against.
+ * @returns True if the result is "empty", meaning all pixels are fully transparent.
+ */
+function maskFromCoverage(imageData: ImageData): boolean {
+  const data = imageData.data;
+  let isEmpty = true;
+  for (let offset = 0; offset < data.length; offset += 4) {
+    const coverage = Math.max(data[offset], data[offset + 1], data[offset + 2]);
+    data[offset] = 255;
+    data[offset + 1] = 255;
+    data[offset + 2] = 255;
+    data[offset + 3] = coverage;
+    if (coverage !== 0) {
+      isEmpty = false;
+    }
+  }
+  return isEmpty;
 }
 
 /**
