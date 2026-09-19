@@ -21,6 +21,7 @@ import { Attributes, Content, NULL_CELL_CHAR, NULL_CELL_CODE } from 'common/buff
 import { ICoreService, IDecorationService, IOptionsService } from 'common/services/Services';
 import { Terminal } from '@xterm/xterm';
 import { GlyphRenderer, percellModule } from './GlyphRenderer';
+import { bgWithoutTag, fgWithoutTag } from './LayerTag';
 import { MoshRenderer } from './MoshRenderer';
 import { RectangleRenderer } from './RectangleRenderer';
 import { COMBINED_CHAR_BIT_MASK, RENDER_MODEL_BG_OFFSET, RENDER_MODEL_EXT_OFFSET, RENDER_MODEL_FG_OFFSET, RENDER_MODEL_INDICIES_PER_CELL, RenderModel } from './RenderModel';
@@ -39,6 +40,8 @@ export class WebglRenderer extends Disposable implements IRenderer {
   private _model: RenderModel = new RenderModel();
   private _workCell: ICellData = new CellData();
   private _workCell2: ICellData = new CellData();
+  // Whether a per-cell mode was on for the last model update.
+  private _percellWasActive = false;
   private _cellColorResolver: CellColorResolver;
 
   private _canvas: HTMLCanvasElement;
@@ -348,7 +351,7 @@ export class WebglRenderer extends Disposable implements IRenderer {
     // Tell renderer the frame is beginning
     // upon a model clear also refresh the full viewport model
     // (also triggered by an atlas page merge, part of #4480)
-    if (this._glyphRenderer.value.beginFrame()) {
+    if (this._glyphRenderer.value.beginFrame(this._core.buffer)) {
       this._clearModel(true);
       this._updateModel(0, this._terminal.rows - 1);
     } else {
@@ -401,6 +404,10 @@ export class WebglRenderer extends Disposable implements IRenderer {
     // The shared per-cell modes change every frame, so while one is on no
     // cell can be skipped for having unchanged content.
     const percellActive = percellModule() !== undefined;
+    // Cells drawn opaque while a mode was on carry that in their vertices,
+    // so the frame after it goes off has to rewrite them too.
+    const forceUpdate = percellActive || this._percellWasActive;
+    this._percellWasActive = percellActive;
     start = clamp(start, terminal.rows - 1, 0);
     end = clamp(end, terminal.rows - 1, 0);
 
@@ -424,6 +431,12 @@ export class WebglRenderer extends Disposable implements IRenderer {
       for (x = 0; x < terminal.cols; x++) {
         lastBg = this._cellColorResolver.result.bg;
         line.loadCell(x, cell);
+        // The layer tag rides in these flags. The renderer reads it from the
+        // buffer before this loop runs, so here it is only removed: left in,
+        // strikethrough and overline would draw a line through the cell and
+        // give it a second atlas entry.
+        cell.fg = fgWithoutTag(cell.fg);
+        cell.bg = bgWithoutTag(cell.bg);
 
         if (x === 0) {
           lastBg = this._cellColorResolver.result.bg;
@@ -490,7 +503,7 @@ export class WebglRenderer extends Disposable implements IRenderer {
         }
 
         // Nothing has changed, no updates needed
-        if (!percellActive &&
+        if (!forceUpdate &&
             this._model.cells[i] === code &&
             this._model.cells[i + RENDER_MODEL_BG_OFFSET] === this._cellColorResolver.result.bg &&
             this._model.cells[i + RENDER_MODEL_FG_OFFSET] === this._cellColorResolver.result.fg &&
@@ -531,7 +544,7 @@ export class WebglRenderer extends Disposable implements IRenderer {
       }
     }
     if (modelUpdated) {
-      this._rectangleRenderer.value!.updateBackgrounds(this._model, this._glyphRenderer.value?.pixelPlaneGlyphs);
+      this._rectangleRenderer.value!.updateBackgrounds(this._model, this._glyphRenderer.value?.backgroundLayers);
     }
     this._rectangleRenderer.value!.updateCursor(this._model);
   }

@@ -394,13 +394,14 @@ export class RectangleRenderer extends Disposable {
   }
 
   /**
-   * `pixelGlyphs` names the cells the glyph renderer draws opaque, with
-   * their background baked into the quad. Those get no rectangle here: a
-   * per-cell mode moves the quad and a rectangle would stay behind,
-   * leaving a copy of the cell where it used to be. Undefined means every
-   * cell keeps its rectangle, which is the case with tint off.
+   * `backgroundLayers` is the layer each cell resolved to. A cell above the
+   * content layer is drawn opaque by the glyph renderer, with its background
+   * baked into the quad, so it gets no rectangle here: a per-cell mode moves
+   * the quad and a rectangle would stay behind, leaving a copy of the cell
+   * where it used to be. Undefined means every cell keeps its rectangle,
+   * which is the case with no mode on and with tint off.
    */
-  public updateBackgrounds(model: IRenderModel, pixelGlyphs?: ReadonlySet<number>): void {
+  public updateBackgrounds(model: IRenderModel, backgroundLayers?: Uint8Array): void {
     const terminal = this._terminal;
     const vertices = this._vertices;
 
@@ -425,7 +426,7 @@ export class RectangleRenderer extends Disposable {
       currentInverse = false;
       for (x = 0; x < terminal.cols; x++) {
         modelIndex = ((y * terminal.cols) + x) * RENDER_MODEL_INDICIES_PER_CELL;
-        if (pixelGlyphs !== undefined && pixelGlyphs.has(model.cells[modelIndex])) {
+        if (backgroundLayers !== undefined && backgroundLayers[y * terminal.cols + x] > 0) {
           // Reads as the default background, so the run in progress ends
           // here and no rectangle is emitted for this cell.
           bg = 0;

@@ -7,10 +7,12 @@ import { allowRescaling, throwIfFalsy } from 'browser/renderer/shared/RendererUt
 import { TextureAtlas } from 'browser/renderer/shared/TextureAtlas';
 import { IRasterizedGlyph, IRenderDimensions, ITextureAtlas } from 'browser/renderer/shared/Types';
 import { NULL_CELL_CODE } from 'common/buffer/Constants';
+import type { IBuffer } from 'common/buffer/Types';
 import { Disposable, toDisposable } from 'common/Lifecycle';
 import { Terminal } from '@xterm/xterm';
 import { IRenderModel, IWebGL2RenderingContext, IWebGLVertexArrayObject } from './Types';
 import { backgroundRgba } from './CellBackground';
+import { layerTag } from './LayerTag';
 import { createProgram, GLTexture, PROJECTION_MATRIX } from './WebglUtils';
 import type { IThemeService } from 'browser/services/Services';
 import type { IOptionsService } from 'common/services/Services';
@@ -305,6 +307,8 @@ let $leftCellPadding = 0;
 let $clippedPixels = 0;
 let $fgRgba = 0;
 let $bgRgba = 0;
+let $backgroundLayer = false;
+let $solid = false;
 
 // shaderBit maps one foreground filter name onto its bit in the u_badgl
 // mask. The bit order is the order the filters compose in the shader.
@@ -371,13 +375,19 @@ export interface IPercellModule {
   active: boolean;
   geometry(cols: number, rows: number, frame: number): Float32Array;
   substitute(code: number, dc: number, dr: number): number;
-  /** One code point per cell, row-major, written before geometry is asked for. */
-  glyphs(length: number): Uint32Array;
-  /** The amounts for one layer: 0 content, 1 pixel. */
-  stateFor(layer: number): Float32Array;
-  /** The code points that mark the pixel plane, which the shared crate owns. */
-  pixelGlyphCount(): number;
-  pixelGlyph(i: number): number;
+  /**
+   * Sizes the grid the module reads for `length` cells, all untagged and
+   * blank, and points `tags` and `glyphs` at it. Both views are rebuilt in
+   * this one call because sizing either can grow wasm memory and detach
+   * a view made before it, so neither survives a later call into the module.
+   */
+  prepareGrid(length: number): void;
+  /** One layer tag per cell, row-major: 0 for none, else the layer index plus one. */
+  tags: Uint8Array;
+  /** One code point per cell, row-major. Only cells with no tag are read. */
+  glyphs: Uint32Array;
+  /** The layer each cell resolved to in the last geometry call, one byte per cell. */
+  layers(length: number): Uint8Array;
 }
 
 // percellModule returns the module while a per-cell mode is on, and
@@ -451,7 +461,10 @@ export class GlyphRenderer extends Disposable {
   private _activeBuffer: number = 0;
   private _frameCount: number = 0;
   private _percell: IPercellModule | undefined;
-  private _pixelGlyphs: Set<number> | undefined;
+  // The layer each cell resolved to this frame, while cells above content
+  // draw opaque with their own background. Undefined when no per-cell mode
+  // is on, and with tint off, where the atlas has no stencil to mix across.
+  private _backgroundLayers: Uint8Array | undefined;
   private _percellGeometry: Float32Array | undefined;
   private _substitutionBudget: number = 0;
   private _substitutionRefilledAt: number = 0;
@@ -588,7 +601,7 @@ export class GlyphRenderer extends Disposable {
     this.handleResize();
   }
 
-  public beginFrame(): boolean {
+  public beginFrame(buffer?: IBuffer): boolean {
     // One call into the shared core per frame for the whole grid. The
     // frame is wall-clock 60 Hz, which is the rate native and
     // TouchDesigner step at; a render count would run faster whenever the
@@ -596,32 +609,39 @@ export class GlyphRenderer extends Disposable {
     this._percell = percellModule();
     const now = performance.now();
     this._percellFrame = Math.floor(now / (1000 / 60));
-    // Which code points mark the pixel plane is the shared crate's
-    // decision, so the set is read from it rather than written here.
-    // Once per module, not once per frame.
-    if (this._percell && !this._pixelGlyphs) {
-      const marks = new Set<number>();
-      for (let i = 0; i < this._percell.pixelGlyphCount(); i++) {
-        marks.add(this._percell.pixelGlyph(i));
-      }
-      this._pixelGlyphs = marks;
-    }
-    // The shared core decides each cell's layer from its glyph, so the
-    // grid crosses before the geometry comes back. The view is taken
-    // from the pointer the call returns, since resizing that buffer can
-    // grow wasm memory and detach any view made earlier.
-    if (this._percell) {
-      const cells = this._terminal.cols * this._terminal.rows;
-      const glyphs = this._percell.glyphs(cells);
-      const buffer = this._terminal.buffer.active;
-      for (let y = 0; y < this._terminal.rows; y++) {
-        const line = buffer.getLine(buffer.viewportY + y);
-        for (let x = 0; x < this._terminal.cols; x++) {
-          glyphs[y * this._terminal.cols + x] = line?.getCell(x)?.getCode() ?? 32;
+    this._percellGeometry = undefined;
+    this._backgroundLayers = undefined;
+    if (this._percell && buffer) {
+      // The core decides each cell's layer, from the tag the scene gave it
+      // or from its glyph when it gave none, so the grid crosses before
+      // the geometry comes back. Tags and glyphs are read straight from the
+      // buffer's words: no cell objects, and a code point only for the
+      // cells that have no tag. Every view is taken after the call that
+      // returns its pointer, since sizing a buffer can grow wasm memory.
+      const cols = this._terminal.cols;
+      const rows = this._terminal.rows;
+      const cells = cols * rows;
+      this._percell.prepareGrid(cells);
+      const tags = this._percell.tags;
+      const glyphs = this._percell.glyphs;
+      for (let y = 0; y < rows; y++) {
+        const line = buffer.lines.get(buffer.ydisp + y);
+        if (!line) {
+          continue;
+        }
+        for (let x = 0; x < cols; x++) {
+          const tag = layerTag(line.getFg(x), line.getBg(x));
+          tags[y * cols + x] = tag;
+          if (tag === 0) {
+            glyphs[y * cols + x] = line.getCodePoint(x);
+          }
         }
       }
+      this._percellGeometry = this._percell.geometry(cols, rows, this._percellFrame);
+      if (TextureAtlas.tintGlyphs) {
+        this._backgroundLayers = this._percell.layers(cells);
+      }
     }
-    this._percellGeometry = this._percell?.geometry(this._terminal.cols, this._terminal.rows, this._percellFrame);
     this._substitutionBudget = Math.min(SUBSTITUTION_BUDGET, this._substitutionBudget + (now - this._substitutionRefilledAt) / SUBSTITUTION_REFILL_MS * SUBSTITUTION_BUDGET);
     this._substitutionRefilledAt = now;
     // Cells update in scan order, so a budget spent first come first
@@ -642,22 +662,12 @@ export class GlyphRenderer extends Disposable {
   }
 
   /**
-   * Whether a cell draws as an opaque pixel-plane quad, background and
-   * all. A colour-keyed atlas bakes the colour into the texel and keys
-   * the background out to transparent, leaving no coverage mask to mix
-   * across, so with tint off nothing takes this path.
+   * The layer each cell resolved to, for the cells the rectangle renderer
+   * must not draw a background for because this renderer draws them opaque.
+   * Undefined means every cell keeps its rectangle.
    */
-  private _isPixelPlane(code: number | undefined): boolean {
-    return TextureAtlas.tintGlyphs && code !== undefined && this._pixelGlyphs !== undefined && this._pixelGlyphs.has(code);
-  }
-
-  /**
-   * The cells the rectangle renderer must not draw a background for,
-   * because this renderer already draws them opaque. Undefined means
-   * every cell keeps its rectangle, which is the case with tint off.
-   */
-  public get pixelPlaneGlyphs(): ReadonlySet<number> | undefined {
-    return TextureAtlas.tintGlyphs ? this._pixelGlyphs : undefined;
+  public get backgroundLayers(): Uint8Array | undefined {
+    return this._backgroundLayers;
   }
 
   private _updateCell(array: Float32Array, x: number, y: number, code: number | undefined, bg: number, fg: number, ext: number, chars: string, width: number, lastBg: number): void {
@@ -716,8 +726,31 @@ export class GlyphRenderer extends Disposable {
       $glyph = this._atlas.getRasterizedGlyph(code, bg, fg, ext, false);
     }
 
+    // A cell above the content layer draws opaque, with its own background
+    // mixed in. Its glyph may be empty (a space, which is what a sky is made
+    // of), and an empty glyph has no quad, so that cell gets a full-cell one
+    // that samples nothing.
+    $backgroundLayer = this._backgroundLayers !== undefined && this._backgroundLayers.length === samples && this._backgroundLayers[sample] > 0;
+    $solid = $backgroundLayer && ($glyph.size.x === 0 || $glyph.size.y === 0);
+    if ($backgroundLayer) {
+      $bgRgba = backgroundRgba(this._themeService, fg, bg);
+    }
+
     $leftCellPadding = Math.floor((this._dimensions.device.cell.width - this._dimensions.device.char.width) / 2);
-    if (bg !== lastBg && $glyph.offset.x > $leftCellPadding) {
+    if ($solid) {
+      // a_origin: the cell's own corner
+      array[$i    ] = 0;
+      array[$i + 1] = 0;
+      // a_size: the whole cell
+      array[$i + 2] = this._dimensions.device.cell.width / this._dimensions.device.canvas.width;
+      array[$i + 3] = this._dimensions.device.cell.height / this._dimensions.device.canvas.height;
+      // a_texpage, a_texcoord, a_texsize: nothing to sample
+      array[$i + 4] = 0;
+      array[$i + 5] = 0;
+      array[$i + 6] = 0;
+      array[$i + 7] = 0;
+      array[$i + 8] = 0;
+    } else if (bg !== lastBg && $glyph.offset.x > $leftCellPadding) {
       // The glyph may carry a stale page index from a mid-frame merge;
       // the next frame reindexes, so drop the cell instead of throwing.
       const texPage = this._atlas.pages[$glyph.texturePage];
@@ -758,7 +791,14 @@ export class GlyphRenderer extends Disposable {
     }
     // a_color: the cell's foreground for a tinted mask, white for a glyph
     // whose colour is already baked into the atlas.
-    if (TextureAtlas.tintGlyphs) {
+    if ($solid) {
+      // Foreground and background the same, so the mix returns the
+      // background whatever the atlas holds at the point it samples.
+      array[$i + 9] = (($bgRgba >>> 24) & 0xFF) / 255;
+      array[$i + 10] = (($bgRgba >>> 16) & 0xFF) / 255;
+      array[$i + 11] = (($bgRgba >>> 8) & 0xFF) / 255;
+      array[$i + 12] = 1;
+    } else if (TextureAtlas.tintGlyphs) {
       $fgRgba = this._atlas.getFgColor(bg, fg, ext, chars && chars.length > 1 ? chars.charCodeAt(0) : code);
       array[$i + 9] = (($fgRgba >>> 24) & 0xFF) / 255;
       array[$i + 10] = (($fgRgba >>> 16) & 0xFF) / 255;
@@ -770,13 +810,12 @@ export class GlyphRenderer extends Disposable {
       array[$i + 11] = 1;
       array[$i + 12] = 1;
     }
-    // a_bgcolor: a pixel-plane cell draws opaque with its background
-    // mixed in and gets no rectangle behind it, so it can move without
-    // leaving one. Alpha 0 marks every other cell, which draws as before.
-    // A colour-keyed atlas has no coverage mask to mix across, so with
-    // tint off these cells stay on the old path, rectangle and all.
-    if (this._isPixelPlane(code)) {
-      $bgRgba = backgroundRgba(this._themeService, fg, bg);
+    // a_bgcolor: a cell above the content layer draws opaque with its
+    // background mixed in and gets no rectangle behind it, so it can move
+    // without leaving one. Alpha 0 marks every other cell, which draws as
+    // before. A colour-keyed atlas has no coverage mask to mix across, so
+    // with tint off no cell is above the content layer.
+    if ($backgroundLayer) {
       array[$i + 13] = (($bgRgba >>> 24) & 0xFF) / 255;
       array[$i + 14] = (($bgRgba >>> 16) & 0xFF) / 255;
       array[$i + 15] = (($bgRgba >>> 8) & 0xFF) / 255;
