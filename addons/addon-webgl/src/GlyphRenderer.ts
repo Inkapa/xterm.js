@@ -13,6 +13,8 @@ import { Terminal } from '@xterm/xterm';
 import { IRenderModel, IWebGL2RenderingContext, IWebGLVertexArrayObject } from './Types';
 import { backgroundRgba } from './CellBackground';
 import { layerTag } from './LayerTag';
+import { hashLine } from './PlanePayload';
+import { PlaneStore } from './PlaneStore';
 import { createProgram, GLTexture, PROJECTION_MATRIX } from './WebglUtils';
 import type { IThemeService } from 'browser/services/Services';
 import type { IOptionsService } from 'common/services/Services';
@@ -380,13 +382,20 @@ export interface IPercellModule {
    * blank, and points `tags` and `glyphs` at it. Both views are rebuilt in
    * this one call because sizing either can grow wasm memory and detach
    * a view made before it, so neither survives a later call into the module.
+   * The extras buffer is sized in the same call for the same reason.
    */
-  prepareGrid(length: number): void;
+  prepareGrid(length: number, extraCount?: number): void;
+  /**
+   * The cells other planes cover, three words each: column, row and layer
+   * tag. Built by prepareGrid with the views above, and the geometry call
+   * then holds `length + extraCount` samples per channel, the extras last.
+   */
+  extras: Uint32Array;
   /** One layer tag per cell, row-major: 0 for none, else the layer index plus one. */
   tags: Uint8Array;
   /** One code point per cell, row-major. Only cells with no tag are read. */
   glyphs: Uint32Array;
-  /** The layer each cell resolved to in the last geometry call, one byte per cell. */
+  /** The layer each sample resolved to in the last geometry call, one byte per cell and then per extra. */
   layers(length: number): Uint8Array;
 }
 
@@ -473,6 +482,28 @@ export class GlyphRenderer extends Disposable {
   private _substitutionMisses: number = 0;
   private _substitutionStride: number = 1;
   private _percellFrame: number = 0;
+  // Plane mode. A frame that carries plane data draws every plane's cells, the
+  // ones another plane covers as extra vertex slots after the grid's own, back
+  // to front, with the bottom plane backed by a rectangle at rest.
+  private _planeMode: boolean = false;
+  private _sampleCount: number = 0;
+  private _bottomTag: number = 0;
+  private _extraCount: number = 0;
+  private _extraCapacity: number = 0;
+  private _extraX = new Uint16Array(0);
+  private _extraY = new Uint16Array(0);
+  private _extraTag = new Uint8Array(0);
+  private _extraCode = new Uint32Array(0);
+  private _extraFg = new Uint32Array(0);
+  private _extraBg = new Uint32Array(0);
+  private _extraOver = new Uint8Array(0);
+  // 1 for a flat cell whose top-plane cell has a transparent background.
+  private _flatOver = new Uint8Array(0);
+  // 1 for a flat cell that must not get a rectangle in plane mode.
+  private _rectSkip = new Uint8Array(0);
+  private readonly _planeCounts = new Int32Array(9);
+  private readonly _planeOffsets = new Int32Array(9);
+  private readonly _backing = { count: 0, x: new Uint16Array(0), y: new Uint16Array(0), bg: new Uint32Array(0) };
   private readonly _vertices: IVertices = {
     count: 0,
     attributes: new Float32Array(0),
@@ -601,7 +632,7 @@ export class GlyphRenderer extends Disposable {
     this.handleResize();
   }
 
-  public beginFrame(buffer?: IBuffer): boolean {
+  public beginFrame(buffer?: IBuffer, planes?: PlaneStore): boolean {
     // One call into the shared core per frame for the whole grid. The
     // frame is wall-clock 60 Hz, which is the rate native and
     // TouchDesigner step at; a render count would run faster whenever the
@@ -611,6 +642,9 @@ export class GlyphRenderer extends Disposable {
     this._percellFrame = Math.floor(now / (1000 / 60));
     this._percellGeometry = undefined;
     this._backgroundLayers = undefined;
+    this._planeMode = false;
+    this._extraCount = 0;
+    this._sampleCount = this._terminal.cols * this._terminal.rows;
     if (this._percell && buffer) {
       // The core decides each cell's layer, from the tag the scene gave it
       // or from its glyph when it gave none, so the grid crosses before
@@ -621,7 +655,12 @@ export class GlyphRenderer extends Disposable {
       const cols = this._terminal.cols;
       const rows = this._terminal.rows;
       const cells = cols * rows;
-      this._percell.prepareGrid(cells);
+      // A frame that carries plane data also hands the core the cells the
+      // planes hide, which only a tinted atlas can draw.
+      if (planes && TextureAtlas.tintGlyphs && planes.hasRows) {
+        this._collectPlanes(buffer, planes, cols, rows);
+      }
+      this._percell.prepareGrid(cells, this._extraCount);
       const tags = this._percell.tags;
       const glyphs = this._percell.glyphs;
       for (let y = 0; y < rows; y++) {
@@ -637,9 +676,21 @@ export class GlyphRenderer extends Disposable {
           }
         }
       }
+      if (this._extraCount > 0) {
+        const words = this._percell.extras;
+        for (let k = 0; k < this._extraCount; k++) {
+          words[k * 3] = this._extraX[k];
+          words[k * 3 + 1] = this._extraY[k];
+          words[k * 3 + 2] = this._extraTag[k];
+        }
+      }
+      this._sampleCount = cells + this._extraCount;
       this._percellGeometry = this._percell.geometry(cols, rows, this._percellFrame);
       if (TextureAtlas.tintGlyphs) {
-        this._backgroundLayers = this._percell.layers(cells);
+        this._backgroundLayers = this._percell.layers(this._sampleCount);
+        if (this._planeMode) {
+          this._preparePlaneFrame(cells);
+        }
       }
     }
     this._substitutionBudget = Math.min(SUBSTITUTION_BUDGET, this._substitutionBudget + (now - this._substitutionRefilledAt) / SUBSTITUTION_REFILL_MS * SUBSTITUTION_BUDGET);
@@ -651,6 +702,188 @@ export class GlyphRenderer extends Disposable {
     this._substitutionStride = Math.max(1, Math.ceil(this._substitutionMisses / SUBSTITUTION_BUDGET));
     this._substitutionMisses = 0;
     return this._atlas ? this._atlas.beginFrame() : true;
+  }
+
+  /**
+   * Gathers the plane data of the rows on screen: the cells other planes
+   * cover, as extras, and the top-plane cells whose backgrounds are
+   * transparent. A row whose flat cells are not the ones its payload came
+   * with has been painted over since, and its payload is ignored.
+   */
+  private _collectPlanes(buffer: IBuffer, planes: PlaneStore, cols: number, rows: number): void {
+    if (this._flatOver.length !== cols * rows) {
+      this._flatOver = new Uint8Array(cols * rows);
+    } else {
+      this._flatOver.fill(0);
+    }
+    let extras = 0;
+    let markers = false;
+    for (let y = 0; y < rows; y++) {
+      const absoluteRow = buffer.ydisp + y;
+      const row = planes.rowAt(absoluteRow);
+      const line = row && buffer.lines.get(absoluteRow);
+      if (!row || !line || hashLine(line, cols) !== row.hash) {
+        continue;
+      }
+      for (let m = 0; m < row.markers.length; m++) {
+        const x = row.markers[m] + row.shift;
+        if (x < cols) {
+          this._flatOver[y * cols + x] = 1;
+          markers = true;
+        }
+      }
+      this._growExtras(extras + row.count);
+      for (let k = 0; k < row.count; k++) {
+        const x = row.x[k] + row.shift;
+        if (x >= cols) {
+          continue;
+        }
+        this._extraX[extras] = x;
+        this._extraY[extras] = y;
+        this._extraTag[extras] = row.tag[k];
+        this._extraCode[extras] = row.code[k];
+        this._extraFg[extras] = row.fg[k];
+        this._extraBg[extras] = row.bg[k];
+        this._extraOver[extras] = row.over[k];
+        extras++;
+      }
+    }
+    this._extraCount = extras;
+    this._planeMode = extras > 0 || markers;
+  }
+
+  /** Makes room for `count` extras in the plane arrays and in the vertex buffers. */
+  private _growExtras(count: number): void {
+    if (count <= this._extraCapacity) {
+      return;
+    }
+    let capacity = Math.max(64, this._extraCapacity);
+    while (capacity < count) {
+      capacity *= 2;
+    }
+    const widen = <T extends Uint8Array | Uint16Array | Uint32Array>(old: T): T => {
+      const wider = new (old.constructor as new (n: number) => T)(capacity);
+      wider.set(old);
+      return wider;
+    };
+    this._extraX = widen(this._extraX);
+    this._extraY = widen(this._extraY);
+    this._extraTag = widen(this._extraTag);
+    this._extraCode = widen(this._extraCode);
+    this._extraFg = widen(this._extraFg);
+    this._extraBg = widen(this._extraBg);
+    this._extraOver = widen(this._extraOver);
+    this._extraCapacity = capacity;
+    const total = (this._terminal.cols * this._terminal.rows + capacity) * INDICES_PER_CELL;
+    const widenFloats = (old: Float32Array): Float32Array => {
+      const wider = new Float32Array(total);
+      wider.set(old);
+      return wider;
+    };
+    this._vertices.attributes = widenFloats(this._vertices.attributes);
+    for (let i = 0; i < this._vertices.attributesBuffers.length; i++) {
+      this._vertices.attributesBuffers[i] = widenFloats(this._vertices.attributesBuffers[i]);
+    }
+    this._vertices.count = total;
+  }
+
+  /**
+   * Works out what plane mode needs beyond the geometry: which plane is the
+   * bottom one, which flat cells keep a rectangle at rest, and which extras
+   * are backed. The bottom plane is the highest tag value in use, and it is
+   * the only one backed; every other cell draws as an opaque quad that moves
+   * with its background.
+   */
+  private _preparePlaneFrame(cells: number): void {
+    const layers = this._backgroundLayers!;
+    let bottom = 0;
+    for (let sample = 0; sample < this._sampleCount; sample++) {
+      if (layers[sample] + 1 > bottom) {
+        bottom = layers[sample] + 1;
+      }
+    }
+    this._bottomTag = bottom;
+    if (this._rectSkip.length !== cells) {
+      this._rectSkip = new Uint8Array(cells);
+    }
+    for (let sample = 0; sample < cells; sample++) {
+      this._rectSkip[sample] = (layers[sample] + 1 !== bottom || this._flatOver[sample] !== 0) ? 1 : 0;
+    }
+    const backing = this._backing;
+    if (backing.x.length < this._extraCount) {
+      backing.x = new Uint16Array(this._extraCapacity);
+      backing.y = new Uint16Array(this._extraCapacity);
+      backing.bg = new Uint32Array(this._extraCapacity);
+    }
+    backing.count = 0;
+    for (let k = 0; k < this._extraCount; k++) {
+      if (this._extraTag[k] === bottom && this._extraOver[k] === 0) {
+        backing.x[backing.count] = this._extraX[k];
+        backing.y[backing.count] = this._extraY[k];
+        backing.bg[backing.count] = this._extraBg[k];
+        backing.count++;
+      }
+    }
+  }
+
+  /** Writes the extras' vertices, after the grid's own, from the current atlas. */
+  private _writeExtras(): void {
+    const array = this._vertices.attributes;
+    const cells = this._terminal.cols * this._terminal.rows;
+    const cols = this._terminal.cols;
+    const rows = this._terminal.rows;
+    for (let k = 0; k < this._extraCount; k++) {
+      const sample = cells + k;
+      // a_cellpos: the position an extra was last at is not its own.
+      array[sample * INDICES_PER_CELL + 17] = this._extraX[k] / cols;
+      array[sample * INDICES_PER_CELL + 18] = this._extraY[k] / rows;
+      this._updateCell(array, this._extraX[k], this._extraY[k], this._extraCode[k], this._extraBg[k], this._extraFg[k], 0, '', 1, 0, sample);
+    }
+  }
+
+  /**
+   * Copies the vertices to the upload buffer in draw order: the plane with the
+   * highest tag value first and the front plane last, so each plane blends over
+   * the ones behind it. Returns the number of floats copied.
+   */
+  private _compactByPlane(activeBuffer: Float32Array, renderModel: IRenderModel): number {
+    const cols = this._terminal.cols;
+    const cells = cols * this._terminal.rows;
+    const layers = this._backgroundLayers!;
+    const source = this._vertices.attributes;
+    const counts = this._planeCounts;
+    const offsets = this._planeOffsets;
+    counts.fill(0);
+    for (let y = 0; y < renderModel.lineLengths.length; y++) {
+      for (let x = 0; x < renderModel.lineLengths[y]; x++) {
+        counts[layers[y * cols + x] + 1]++;
+      }
+    }
+    for (let k = 0; k < this._extraCount; k++) {
+      counts[this._extraTag[k]]++;
+    }
+    let running = 0;
+    for (let tag = 7; tag >= 1; tag--) {
+      offsets[tag] = running;
+      running += counts[tag];
+    }
+    const copy = (sample: number, tag: number): void => {
+      const from = sample * INDICES_PER_CELL;
+      const to = offsets[tag]++ * INDICES_PER_CELL;
+      for (let j = 0; j < INDICES_PER_CELL; j++) {
+        activeBuffer[to + j] = source[from + j];
+      }
+    };
+    for (let y = 0; y < renderModel.lineLengths.length; y++) {
+      for (let x = 0; x < renderModel.lineLengths[y]; x++) {
+        const sample = y * cols + x;
+        copy(sample, layers[sample] + 1);
+      }
+    }
+    for (let k = 0; k < this._extraCount; k++) {
+      copy(cells + k, this._extraTag[k]);
+    }
+    return running * INDICES_PER_CELL;
   }
 
   public updateCell(x: number, y: number, code: number, bg: number, fg: number, ext: number, chars: string, width: number, lastBg: number): void {
@@ -667,11 +900,25 @@ export class GlyphRenderer extends Disposable {
    * Undefined means every cell keeps its rectangle.
    */
   public get backgroundLayers(): Uint8Array | undefined {
-    return this._backgroundLayers;
+    // In plane mode the rectangle renderer keeps a rectangle only for the
+    // bottom plane's opaque cells, which is how that plane is backed.
+    return this._planeMode ? this._rectSkip : this._backgroundLayers;
   }
 
-  private _updateCell(array: Float32Array, x: number, y: number, code: number | undefined, bg: number, fg: number, ext: number, chars: string, width: number, lastBg: number): void {
-    $i = (y * this._terminal.cols + x) * INDICES_PER_CELL;
+  /**
+   * The bottom plane's hidden opaque cells, which need a rectangle at rest
+   * as the flat cells of that plane do. Undefined outside plane mode.
+   */
+  public get backing(): { count: number, x: Uint16Array, y: Uint16Array, bg: Uint32Array } | undefined {
+    return this._planeMode ? this._backing : undefined;
+  }
+
+  /**
+   * `sample` is the cell's slot and its place in the geometry: the grid's cells
+   * are `y * cols + x`, and an extra is `cols * rows + k`.
+   */
+  private _updateCell(array: Float32Array, x: number, y: number, code: number | undefined, bg: number, fg: number, ext: number, chars: string, width: number, lastBg: number, sample: number = y * this._terminal.cols + x): void {
+    $i = sample * INDICES_PER_CELL;
 
     // Exit early if this is a null character, allow space character to continue as it may have
     // underline/strikethrough styles
@@ -686,9 +933,8 @@ export class GlyphRenderer extends Disposable {
 
     // Shared per-cell geometry, computed for the whole grid in beginFrame.
     // A stale buffer from before a resize is ignored for that frame.
-    const samples = this._terminal.cols * this._terminal.rows;
+    const samples = this._sampleCount;
     const geometry = this._percellGeometry && this._percellGeometry.length === PercellChannel.COUNT * samples ? this._percellGeometry : undefined;
-    const sample = y * this._terminal.cols + x;
     if (geometry) {
       if (geometry[PercellChannel.ACTIVE * samples + sample] === 0) {
         array.fill(0, $i, $i + INDICES_PER_CELL - CELL_POSITION_INDICES);
@@ -730,7 +976,14 @@ export class GlyphRenderer extends Disposable {
     // mixed in. Its glyph may be empty (a space, which is what a sky is made
     // of), and an empty glyph has no quad, so that cell gets a full-cell one
     // that samples nothing.
-    $backgroundLayer = this._backgroundLayers !== undefined && this._backgroundLayers.length === samples && this._backgroundLayers[sample] > 0;
+    if (this._planeMode) {
+      // Every cell of a frame with planes draws opaque with its own
+      // background, moving with it, unless its background is transparent.
+      $backgroundLayer = this._backgroundLayers !== undefined && this._backgroundLayers.length === samples &&
+        (sample < this._terminal.cols * this._terminal.rows ? this._flatOver[sample] === 0 : this._extraOver[sample - this._terminal.cols * this._terminal.rows] === 0);
+    } else {
+      $backgroundLayer = this._backgroundLayers !== undefined && this._backgroundLayers.length === samples && this._backgroundLayers[sample] > 0;
+    }
     $solid = $backgroundLayer && ($glyph.size.x === 0 || $glyph.size.y === 0);
     if ($backgroundLayer) {
       $bgRgba = backgroundRgba(this._themeService, fg, bg);
@@ -864,7 +1117,7 @@ export class GlyphRenderer extends Disposable {
 
   public clear(): void {
     const terminal = this._terminal;
-    const newCount = terminal.cols * terminal.rows * INDICES_PER_CELL;
+    const newCount = (terminal.cols * terminal.rows + this._extraCapacity) * INDICES_PER_CELL;
 
     // Clear vertices
     if (this._vertices.count !== newCount) {
@@ -932,11 +1185,16 @@ export class GlyphRenderer extends Disposable {
     //   is a selection
     // - So we don't send vertices for all the line-ending whitespace to the GPU
     let bufferLength = 0;
-    for (let y = 0; y < renderModel.lineLengths.length; y++) {
-      const si = y * this._terminal.cols * INDICES_PER_CELL;
-      const sub = this._vertices.attributes.subarray(si, si + renderModel.lineLengths[y] * INDICES_PER_CELL);
-      activeBuffer.set(sub, bufferLength);
-      bufferLength += sub.length;
+    if (this._planeMode) {
+      this._writeExtras();
+      bufferLength = this._compactByPlane(activeBuffer, renderModel);
+    } else {
+      for (let y = 0; y < renderModel.lineLengths.length; y++) {
+        const si = y * this._terminal.cols * INDICES_PER_CELL;
+        const sub = this._vertices.attributes.subarray(si, si + renderModel.lineLengths[y] * INDICES_PER_CELL);
+        activeBuffer.set(sub, bufferLength);
+        bufferLength += sub.length;
+      }
     }
 
     // Bind the attributes buffer

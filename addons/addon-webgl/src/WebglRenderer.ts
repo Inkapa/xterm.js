@@ -22,6 +22,7 @@ import { ICoreService, IDecorationService, IOptionsService } from 'common/servic
 import { Terminal } from '@xterm/xterm';
 import { GlyphRenderer, percellModule } from './GlyphRenderer';
 import { bgWithoutTag, fgWithoutTag } from './LayerTag';
+import { PlaneStore } from './PlaneStore';
 import { MoshRenderer } from './MoshRenderer';
 import { RectangleRenderer } from './RectangleRenderer';
 import { COMBINED_CHAR_BIT_MASK, RENDER_MODEL_BG_OFFSET, RENDER_MODEL_EXT_OFFSET, RENDER_MODEL_FG_OFFSET, RENDER_MODEL_INDICIES_PER_CELL, RenderModel } from './RenderModel';
@@ -31,6 +32,9 @@ import { IRenderLayer } from './renderLayer/Types';
 
 export class WebglRenderer extends Disposable implements IRenderer {
   private _renderLayers: IRenderLayer[];
+  // The plane payloads the door sends, read by the glyph pass and the
+  // rectangle pass (see PlaneStore).
+  private readonly _planes: PlaneStore;
   private _cursorBlinkStateManager: MutableDisposable<CursorBlinkStateManager> = new MutableDisposable();
   private _charAtlasDisposable = this.register(new MutableDisposable());
   private _charAtlas: ITextureAtlas | undefined;
@@ -85,6 +89,8 @@ export class WebglRenderer extends Disposable implements IRenderer {
     this._cellColorResolver = new CellColorResolver(this._terminal, this._optionsService, this._model.selection, this._decorationService, this._coreBrowserService, this._themeService);
 
     this._core = (this._terminal as any)._core;
+    this._planes = new PlaneStore(this._terminal);
+    this.register({ dispose: () => this._planes.dispose() });
 
     this._renderLayers = [
       new LinkRenderLayer(this._core.screenElement!, 2, this._terminal, this._core.linkifier!, this._coreBrowserService, _optionsService, this._themeService)
@@ -351,7 +357,7 @@ export class WebglRenderer extends Disposable implements IRenderer {
     // Tell renderer the frame is beginning
     // upon a model clear also refresh the full viewport model
     // (also triggered by an atlas page merge, part of #4480)
-    if (this._glyphRenderer.value.beginFrame(this._core.buffer)) {
+    if (this._glyphRenderer.value.beginFrame(this._core.buffer, this._planes)) {
       this._clearModel(true);
       this._updateModel(0, this._terminal.rows - 1);
     } else {
@@ -544,7 +550,7 @@ export class WebglRenderer extends Disposable implements IRenderer {
       }
     }
     if (modelUpdated) {
-      this._rectangleRenderer.value!.updateBackgrounds(this._model, this._glyphRenderer.value?.backgroundLayers);
+      this._rectangleRenderer.value!.updateBackgrounds(this._model, this._glyphRenderer.value?.backgroundLayers, this._glyphRenderer.value?.backing);
     }
     this._rectangleRenderer.value!.updateCursor(this._model);
   }

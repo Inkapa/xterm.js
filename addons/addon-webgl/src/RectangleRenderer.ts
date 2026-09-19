@@ -399,9 +399,11 @@ export class RectangleRenderer extends Disposable {
    * baked into the quad, so it gets no rectangle here: a per-cell mode moves
    * the quad and a rectangle would stay behind, leaving a copy of the cell
    * where it used to be. Undefined means every cell keeps its rectangle,
-   * which is the case with no mode on and with tint off.
+   * which is the case with no mode on and with tint off. In plane mode the
+   * same array says which cells keep a rectangle (0) and which do not (1), and
+   * `backing` adds the rectangles for the bottom plane's hidden cells.
    */
-  public updateBackgrounds(model: IRenderModel, backgroundLayers?: Uint8Array): void {
+  public updateBackgrounds(model: IRenderModel, backgroundLayers?: Uint8Array, backing?: { count: number, x: Uint16Array, y: Uint16Array, bg: Uint32Array }): void {
     const terminal = this._terminal;
     const vertices = this._vertices;
 
@@ -453,6 +455,14 @@ export class RectangleRenderer extends Disposable {
       if (currentBg !== 0 || (currentInverse && currentFg !== 0)) {
         offset = rectangleCount++ * INDICES_PER_RECTANGLE;
         this._updateRectangle(vertices, offset, currentFg, currentBg, currentStartX, terminal.cols, y);
+      }
+    }
+    // The bottom plane's cells another plane covers, at rest. They have no
+    // place in the model, which holds only what shows.
+    if (backing) {
+      for (let k = 0; k < backing.count; k++) {
+        offset = rectangleCount++ * INDICES_PER_RECTANGLE;
+        this._updateRectangle(vertices, offset, 0, backing.bg[k], backing.x[k], backing.x[k] + 1, backing.y[k]);
       }
     }
     vertices.count = rectangleCount;
@@ -526,8 +536,11 @@ export class RectangleRenderer extends Disposable {
   private _updateRectangle(vertices: Vertices, offset: number, fg: number, bg: number, startX: number, endX: number, y: number): void {
     $rgba = backgroundRgba(this._themeService, fg, bg);
 
-    if (vertices.attributes.length < offset + 4) {
-      vertices.attributes = expandFloat32Array(vertices.attributes, this._terminal.rows * this._terminal.cols * INDICES_PER_RECTANGLE);
+    if (vertices.attributes.length < offset + INDICES_PER_RECTANGLE) {
+      // One rectangle per cell is the most a frame without planes needs. A frame
+      // with planes adds rectangles for the bottom plane's hidden cells, so the
+      // cap gives way to what this rectangle needs.
+      vertices.attributes = expandFloat32Array(vertices.attributes, Math.max(this._terminal.rows * this._terminal.cols * INDICES_PER_RECTANGLE, (offset + INDICES_PER_RECTANGLE) * 2));
     }
     $x1 = startX * this._dimensions.device.cell.width;
     $y1 = y * this._dimensions.device.cell.height;
