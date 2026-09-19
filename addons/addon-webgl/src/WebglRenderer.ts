@@ -248,7 +248,7 @@ export class WebglRenderer extends Disposable implements IRenderer {
    */
   private _initializeWebGLState(): [RectangleRenderer, GlyphRenderer] {
     this._rectangleRenderer.value = new RectangleRenderer(this._terminal, this._gl, this.dimensions, this._themeService);
-    this._glyphRenderer.value = new GlyphRenderer(this._terminal, this._gl, this.dimensions, this._optionsService);
+    this._glyphRenderer.value = new GlyphRenderer(this._terminal, this._gl, this.dimensions, this._optionsService, this._themeService);
     this._moshRenderer.value = new MoshRenderer(this._gl);
 
     // Update dimensions and acquire char atlas
@@ -531,7 +531,7 @@ export class WebglRenderer extends Disposable implements IRenderer {
       }
     }
     if (modelUpdated) {
-      this._rectangleRenderer.value!.updateBackgrounds(this._model);
+      this._rectangleRenderer.value!.updateBackgrounds(this._model, this._glyphRenderer.value?.pixelPlaneGlyphs);
     }
     this._rectangleRenderer.value!.updateCursor(this._model);
   }

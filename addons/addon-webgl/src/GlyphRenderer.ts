@@ -10,7 +10,9 @@ import { NULL_CELL_CODE } from 'common/buffer/Constants';
 import { Disposable, toDisposable } from 'common/Lifecycle';
 import { Terminal } from '@xterm/xterm';
 import { IRenderModel, IWebGL2RenderingContext, IWebGLVertexArrayObject } from './Types';
+import { backgroundRgba } from './CellBackground';
 import { createProgram, GLTexture, PROJECTION_MATRIX } from './WebglUtils';
+import type { IThemeService } from 'browser/services/Services';
 import type { IOptionsService } from 'common/services/Services';
 
 interface IVertices {
@@ -33,7 +35,8 @@ const enum VertexAttribLocations {
   TEXPAGE = 4,
   TEXCOORD = 5,
   TEXSIZE = 6,
-  COLOR = 7
+  COLOR = 7,
+  BGCOLOR = 8
 }
 
 const vertexShaderSource = `#version 300 es
@@ -45,6 +48,7 @@ layout (location = ${VertexAttribLocations.TEXPAGE}) in float a_texpage;
 layout (location = ${VertexAttribLocations.TEXCOORD}) in vec2 a_texcoord;
 layout (location = ${VertexAttribLocations.TEXSIZE}) in vec2 a_texsize;
 layout (location = ${VertexAttribLocations.COLOR}) in vec4 a_color;
+layout (location = ${VertexAttribLocations.BGCOLOR}) in vec4 a_bgcolor;
 
 uniform mat4 u_projection;
 uniform vec2 u_resolution;
@@ -59,6 +63,7 @@ uniform highp float u_param[4];
 out vec2 v_texcoord;
 flat out int v_texpage;
 out vec4 v_color;
+out vec4 v_bgcolor;
 
 // warpVertex distorts the whole frame at the vertex stage
 // (window.glyph.vtx). Unlike the per-cell geometry pass these are smooth,
@@ -106,6 +111,7 @@ void main() {
   v_texpage = int(a_texpage);
   v_texcoord = a_texcoord + a_unitquad * a_texsize;
   v_color = a_color;
+  v_bgcolor = a_bgcolor;
 }`;
 
 function createFragmentShaderSource(maxFragmentShaderTextureUnits: number): string {
@@ -119,6 +125,7 @@ precision lowp float;
 in vec2 v_texcoord;
 flat in int v_texpage;
 in vec4 v_color;
+in vec4 v_bgcolor;
 
 uniform sampler2D u_texture[${maxFragmentShaderTextureUnits}];
 uniform highp int u_badgl;
@@ -146,8 +153,20 @@ vec4 sampleAtlas(vec2 uv) {
 // holds white coverage masks and v_color is the cell's foreground; a
 // colour-baked atlas already holds the colour and v_color is white. Either
 // way the filters below resample correctly coloured glyphs.
+//
+// A pixel-plane cell carries its background too and covers the whole cell:
+// the upper half block's mask is 1 across the top and 0 across the bottom,
+// so mixing the two colours across it reproduces what the scene painted.
+// Those cells draw opaque and get no rectangle behind them, which is what
+// lets a per-cell mode move one without leaving a copy of it behind. Every
+// filter below is written in terms of this function, the ones that
+// resample at an offset included, so none of them change.
 vec4 sampleAt(vec2 uv) {
-  return v_color * sampleAtlas(uv);
+  vec4 texel = sampleAtlas(uv);
+  if (v_bgcolor.a > 0.0) {
+    return vec4(mix(v_bgcolor.rgb, v_color.rgb, texel.a), 1.0);
+  }
+  return v_color * texel;
 }
 
 // 4x4 Bayer ordered-dither threshold matrix, normalised to [0,1). Ordered
@@ -275,7 +294,7 @@ void main() {
 //   [9..12] colour (rgba)  [13,14] cellpos
 // cellpos is last so a cell that draws nothing can zero everything before it;
 // it is written once per resize in clear().
-const INDICES_PER_CELL = 15;
+const INDICES_PER_CELL = 19;
 const BYTES_PER_CELL = INDICES_PER_CELL * Float32Array.BYTES_PER_ELEMENT;
 const CELL_POSITION_INDICES = 2;
 
@@ -285,6 +304,7 @@ let $glyph: IRasterizedGlyph | undefined = undefined;
 let $leftCellPadding = 0;
 let $clippedPixels = 0;
 let $fgRgba = 0;
+let $bgRgba = 0;
 
 // shaderBit maps one foreground filter name onto its bit in the u_badgl
 // mask. The bit order is the order the filters compose in the shader.
@@ -351,6 +371,13 @@ export interface IPercellModule {
   active: boolean;
   geometry(cols: number, rows: number, frame: number): Float32Array;
   substitute(code: number, dc: number, dr: number): number;
+  /** One code point per cell, row-major, written before geometry is asked for. */
+  glyphs(length: number): Uint32Array;
+  /** The amounts for one layer: 0 content, 1 pixel. */
+  stateFor(layer: number): Float32Array;
+  /** The code points that mark the pixel plane, which the shared crate owns. */
+  pixelGlyphCount(): number;
+  pixelGlyph(i: number): number;
 }
 
 // percellModule returns the module while a per-cell mode is on, and
@@ -424,6 +451,7 @@ export class GlyphRenderer extends Disposable {
   private _activeBuffer: number = 0;
   private _frameCount: number = 0;
   private _percell: IPercellModule | undefined;
+  private _pixelGlyphs: Set<number> | undefined;
   private _percellGeometry: Float32Array | undefined;
   private _substitutionBudget: number = 0;
   private _substitutionRefilledAt: number = 0;
@@ -445,7 +473,8 @@ export class GlyphRenderer extends Disposable {
     private readonly _terminal: Terminal,
     private readonly _gl: IWebGL2RenderingContext,
     private _dimensions: IRenderDimensions,
-    private readonly _optionsService: IOptionsService
+    private readonly _optionsService: IOptionsService,
+    private readonly _themeService: IThemeService
   ) {
     super();
 
@@ -521,8 +550,11 @@ export class GlyphRenderer extends Disposable {
     gl.enableVertexAttribArray(VertexAttribLocations.COLOR);
     gl.vertexAttribPointer(VertexAttribLocations.COLOR, 4, gl.FLOAT, false, BYTES_PER_CELL, 9 * Float32Array.BYTES_PER_ELEMENT);
     gl.vertexAttribDivisor(VertexAttribLocations.COLOR, 1);
+    gl.enableVertexAttribArray(VertexAttribLocations.BGCOLOR);
+    gl.vertexAttribPointer(VertexAttribLocations.BGCOLOR, 4, gl.FLOAT, false, BYTES_PER_CELL, 13 * Float32Array.BYTES_PER_ELEMENT);
+    gl.vertexAttribDivisor(VertexAttribLocations.BGCOLOR, 1);
     gl.enableVertexAttribArray(VertexAttribLocations.CELL_POSITION);
-    gl.vertexAttribPointer(VertexAttribLocations.CELL_POSITION, 2, gl.FLOAT, false, BYTES_PER_CELL, 13 * Float32Array.BYTES_PER_ELEMENT);
+    gl.vertexAttribPointer(VertexAttribLocations.CELL_POSITION, 2, gl.FLOAT, false, BYTES_PER_CELL, 17 * Float32Array.BYTES_PER_ELEMENT);
     gl.vertexAttribDivisor(VertexAttribLocations.CELL_POSITION, 1);
 
     // Setup static uniforms
@@ -564,6 +596,31 @@ export class GlyphRenderer extends Disposable {
     this._percell = percellModule();
     const now = performance.now();
     this._percellFrame = Math.floor(now / (1000 / 60));
+    // Which code points mark the pixel plane is the shared crate's
+    // decision, so the set is read from it rather than written here.
+    // Once per module, not once per frame.
+    if (this._percell && !this._pixelGlyphs) {
+      const marks = new Set<number>();
+      for (let i = 0; i < this._percell.pixelGlyphCount(); i++) {
+        marks.add(this._percell.pixelGlyph(i));
+      }
+      this._pixelGlyphs = marks;
+    }
+    // The shared core decides each cell's layer from its glyph, so the
+    // grid crosses before the geometry comes back. The view is taken
+    // from the pointer the call returns, since resizing that buffer can
+    // grow wasm memory and detach any view made earlier.
+    if (this._percell) {
+      const cells = this._terminal.cols * this._terminal.rows;
+      const glyphs = this._percell.glyphs(cells);
+      const buffer = this._terminal.buffer.active;
+      for (let y = 0; y < this._terminal.rows; y++) {
+        const line = buffer.getLine(buffer.viewportY + y);
+        for (let x = 0; x < this._terminal.cols; x++) {
+          glyphs[y * this._terminal.cols + x] = line?.getCell(x)?.getCode() ?? 32;
+        }
+      }
+    }
     this._percellGeometry = this._percell?.geometry(this._terminal.cols, this._terminal.rows, this._percellFrame);
     this._substitutionBudget = Math.min(SUBSTITUTION_BUDGET, this._substitutionBudget + (now - this._substitutionRefilledAt) / SUBSTITUTION_REFILL_MS * SUBSTITUTION_BUDGET);
     this._substitutionRefilledAt = now;
@@ -582,6 +639,25 @@ export class GlyphRenderer extends Disposable {
     // slight slowdown is acceptable for the developer ergonomics provided as it's a once of for
     // each glyph.
     this._updateCell(this._vertices.attributes, x, y, code, bg, fg, ext, chars, width, lastBg);
+  }
+
+  /**
+   * Whether a cell draws as an opaque pixel-plane quad, background and
+   * all. A colour-keyed atlas bakes the colour into the texel and keys
+   * the background out to transparent, leaving no coverage mask to mix
+   * across, so with tint off nothing takes this path.
+   */
+  private _isPixelPlane(code: number | undefined): boolean {
+    return TextureAtlas.tintGlyphs && code !== undefined && this._pixelGlyphs !== undefined && this._pixelGlyphs.has(code);
+  }
+
+  /**
+   * The cells the rectangle renderer must not draw a background for,
+   * because this renderer already draws them opaque. Undefined means
+   * every cell keeps its rectangle, which is the case with tint off.
+   */
+  public get pixelPlaneGlyphs(): ReadonlySet<number> | undefined {
+    return TextureAtlas.tintGlyphs ? this._pixelGlyphs : undefined;
   }
 
   private _updateCell(array: Float32Array, x: number, y: number, code: number | undefined, bg: number, fg: number, ext: number, chars: string, width: number, lastBg: number): void {
@@ -694,6 +770,23 @@ export class GlyphRenderer extends Disposable {
       array[$i + 11] = 1;
       array[$i + 12] = 1;
     }
+    // a_bgcolor: a pixel-plane cell draws opaque with its background
+    // mixed in and gets no rectangle behind it, so it can move without
+    // leaving one. Alpha 0 marks every other cell, which draws as before.
+    // A colour-keyed atlas has no coverage mask to mix across, so with
+    // tint off these cells stay on the old path, rectangle and all.
+    if (this._isPixelPlane(code)) {
+      $bgRgba = backgroundRgba(this._themeService, fg, bg);
+      array[$i + 13] = (($bgRgba >>> 24) & 0xFF) / 255;
+      array[$i + 14] = (($bgRgba >>> 16) & 0xFF) / 255;
+      array[$i + 15] = (($bgRgba >>> 8) & 0xFF) / 255;
+      array[$i + 16] = 1;
+    } else {
+      array[$i + 13] = 0;
+      array[$i + 14] = 0;
+      array[$i + 15] = 0;
+      array[$i + 16] = 0;
+    }
     // a_cellpos only changes on resize
 
     // Reduce scale horizontally for wide glyphs printed in cells that would overlap with the
@@ -752,8 +845,8 @@ export class GlyphRenderer extends Disposable {
     i = 0;
     for (let y = 0; y < terminal.rows; y++) {
       for (let x = 0; x < terminal.cols; x++) {
-        this._vertices.attributes[i + 13] = x / terminal.cols;
-        this._vertices.attributes[i + 14] = y / terminal.rows;
+        this._vertices.attributes[i + 17] = x / terminal.cols;
+        this._vertices.attributes[i + 18] = y / terminal.rows;
         i += INDICES_PER_CELL;
       }
     }

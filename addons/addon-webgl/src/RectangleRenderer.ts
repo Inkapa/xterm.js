@@ -41,6 +41,7 @@ function glyphCfg(): any {
   return (typeof globalThis !== 'undefined' && (globalThis as any).glyph) || {};
 }
 
+import { backgroundRgba } from './CellBackground';
 import { throwIfFalsy } from 'browser/renderer/shared/RendererUtils';
 import { IRenderDimensions } from 'browser/renderer/shared/Types';
 import { IThemeService } from 'browser/services/Services';
@@ -392,7 +393,14 @@ export class RectangleRenderer extends Disposable {
     );
   }
 
-  public updateBackgrounds(model: IRenderModel): void {
+  /**
+   * `pixelGlyphs` names the cells the glyph renderer draws opaque, with
+   * their background baked into the quad. Those get no rectangle here: a
+   * per-cell mode moves the quad and a rectangle would stay behind,
+   * leaving a copy of the cell where it used to be. Undefined means every
+   * cell keeps its rectangle, which is the case with tint off.
+   */
+  public updateBackgrounds(model: IRenderModel, pixelGlyphs?: ReadonlySet<number>): void {
     const terminal = this._terminal;
     const vertices = this._vertices;
 
@@ -417,9 +425,17 @@ export class RectangleRenderer extends Disposable {
       currentInverse = false;
       for (x = 0; x < terminal.cols; x++) {
         modelIndex = ((y * terminal.cols) + x) * RENDER_MODEL_INDICIES_PER_CELL;
-        bg = model.cells[modelIndex + RENDER_MODEL_BG_OFFSET];
-        fg = model.cells[modelIndex + RENDER_MODEL_FG_OFFSET];
-        inverse = !!(fg & FgFlags.INVERSE);
+        if (pixelGlyphs !== undefined && pixelGlyphs.has(model.cells[modelIndex])) {
+          // Reads as the default background, so the run in progress ends
+          // here and no rectangle is emitted for this cell.
+          bg = 0;
+          fg = 0;
+          inverse = false;
+        } else {
+          bg = model.cells[modelIndex + RENDER_MODEL_BG_OFFSET];
+          fg = model.cells[modelIndex + RENDER_MODEL_FG_OFFSET];
+          inverse = !!(fg & FgFlags.INVERSE);
+        }
         if (bg !== currentBg || (fg !== currentFg && (currentInverse || inverse))) {
           // A rectangle needs to be drawn if going from non-default to another color
           if (currentBg !== 0 || (currentInverse && currentFg !== 0)) {
@@ -507,33 +523,7 @@ export class RectangleRenderer extends Disposable {
   }
 
   private _updateRectangle(vertices: Vertices, offset: number, fg: number, bg: number, startX: number, endX: number, y: number): void {
-    if (fg & FgFlags.INVERSE) {
-      switch (fg & Attributes.CM_MASK) {
-        case Attributes.CM_P16:
-        case Attributes.CM_P256:
-          $rgba = this._themeService.colors.ansi[fg & Attributes.PCOLOR_MASK].rgba;
-          break;
-        case Attributes.CM_RGB:
-          $rgba = (fg & Attributes.RGB_MASK) << 8;
-          break;
-        case Attributes.CM_DEFAULT:
-        default:
-          $rgba = this._themeService.colors.foreground.rgba;
-      }
-    } else {
-      switch (bg & Attributes.CM_MASK) {
-        case Attributes.CM_P16:
-        case Attributes.CM_P256:
-          $rgba = this._themeService.colors.ansi[bg & Attributes.PCOLOR_MASK].rgba;
-          break;
-        case Attributes.CM_RGB:
-          $rgba = (bg & Attributes.RGB_MASK) << 8;
-          break;
-        case Attributes.CM_DEFAULT:
-        default:
-          $rgba = this._themeService.colors.background.rgba;
-      }
-    }
+    $rgba = backgroundRgba(this._themeService, fg, bg);
 
     if (vertices.attributes.length < offset + 4) {
       vertices.attributes = expandFloat32Array(vertices.attributes, this._terminal.rows * this._terminal.cols * INDICES_PER_RECTANGLE);
