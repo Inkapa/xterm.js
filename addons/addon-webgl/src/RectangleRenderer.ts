@@ -19,6 +19,10 @@ function shaderBgBit(name: string): number {
     case 'sweep': return 512;
     case 'dither': return 1024;
     case 'bayer': return 2048;
+    case 'grays': return 4096;
+    // glyph's negative effect at full strength is an inversion, so it is neg.
+    case 'negative': return 16;
+    case 'negativebw': return 8192;
     default: return 0;
   }
 }
@@ -176,8 +180,9 @@ void main() {
     outColor.rgb = outColor.gbr;
   }
   if ((u_badgl & 16) != 0) {
-    // neg: invert
-    outColor = vec4(1.0) - outColor;
+    // neg: invert the colour; alpha stays, or an opaque cell turns
+    // transparent and the frame goes black
+    outColor.rgb = vec3(1.0) - outColor.rgb;
   }
   if ((u_badgl & 32) != 0) {
     // fade: translucent background
@@ -218,6 +223,18 @@ void main() {
     float steps = max(1.0, 3.0 * u_param[3]);
     float d = ditherThreshold(gl_FragCoord.xy) - 0.5;
     outColor.rgb = clamp(floor(outColor.rgb * steps + 0.5 + d), 0.0, steps) / steps;
+  }
+  if ((u_badgl & 4096) != 0) {
+    // grays: luminance in four flat steps with no dither, glyph's grays
+    // effect (renderers/shaders/grays.glsl) at its four-level look.
+    float luminance = dot(outColor.rgb, vec3(0.299, 0.587, 0.114));
+    outColor.rgb = vec3(floor(luminance * 3.0 + 0.5) / 3.0);
+  }
+  if ((u_badgl & 8192) != 0) {
+    // negativebw: a black and white negative, luminance inverted, glyph's
+    // negativebw effect (renderers/shaders/negativebw.glsl) at full strength.
+    float inverted = 1.0 - dot(outColor.rgb, vec3(0.299, 0.587, 0.114));
+    outColor.rgb = vec3(inverted);
   }
 
   // Master crossfade back toward the plain background by u_intensity.
