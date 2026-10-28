@@ -13,6 +13,7 @@ import { Terminal } from '@xterm/xterm';
 import { IRenderModel, IWebGL2RenderingContext, IWebGLVertexArrayObject } from './Types';
 import { backgroundRgba } from './CellBackground';
 import { layerTag, MAX_LAYER_TAG } from './LayerTag';
+import { BlendMode, gpuMode, IPlaneLook, isPlain, planeAlpha, planeRuns, setBlend } from './PlaneLook';
 import { hashLine } from './PlanePayload';
 import { PlaneStore } from './PlaneStore';
 import { createProgram, GLTexture, PROJECTION_MATRIX } from './WebglUtils';
@@ -140,6 +141,10 @@ uniform highp float u_intensity;
 // gain, [3] dither level count. Each multiplies one effect's built-in
 // constant and defaults to 1.0, so a driver shapes a single filter.
 uniform highp float u_param[4];
+// The plane being drawn: the share of it shown, and its blend mode, which
+// shapes the output for the blend state the renderer set (PlaneLook.ts).
+uniform highp float u_planeAlpha;
+uniform int u_planeBlend;
 
 out vec4 outColor;
 
@@ -303,6 +308,13 @@ void main() {
   // Master crossfade: scale the whole filtered result back toward the
   // untouched glyph by u_intensity.
   outColor = mix(glyphClean, outColor, u_intensity);
+
+  outColor.a *= u_planeAlpha;
+  if (u_planeBlend == 1 || u_planeBlend == 5) {
+    outColor = vec4(mix(vec3(1.0), outColor.rgb, outColor.a), 1.0);
+  } else if (u_planeBlend >= 2) {
+    outColor = vec4(outColor.rgb * outColor.a, 1.0);
+  }
 }`);
 }
 
@@ -392,6 +404,11 @@ function glyphCfg(): any {
 // WebAssembly), present once the page has loaded it.
 export interface IPercellModule {
   active: boolean;
+  /**
+   * Whether a plane fades or blends, which needs the planes drawn apart
+   * even when no per-cell mode moves a cell.
+   */
+  looks?: boolean;
   geometry(cols: number, rows: number, frame: number): Float32Array;
   substitute(code: number, dc: number, dr: number): number;
   /**
@@ -416,12 +433,12 @@ export interface IPercellModule {
   layers(length: number): Uint8Array;
 }
 
-// percellModule returns the module while a per-cell mode is on, and
-// undefined otherwise: before the page loads it, in tests, and whenever
-// every per-cell amount is zero.
+// percellModule returns the module while a per-cell mode is on or a plane
+// has a look, and undefined otherwise: before the page loads it, in tests,
+// and whenever every per-cell amount is zero and no plane fades or blends.
 export function percellModule(): IPercellModule | undefined {
   const module = glyphCfg().percell as IPercellModule | undefined;
-  return module && module.active ? module : undefined;
+  return module && (module.active || module.looks) ? module : undefined;
 }
 
 // Channel layout of IPercellModule.geometry, channel-major, one run of
@@ -480,6 +497,8 @@ export class GlyphRenderer extends Disposable {
   private readonly _vtimeLocation: WebGLUniformLocation;
   private readonly _intensityLocation: WebGLUniformLocation;
   private readonly _paramLocation: WebGLUniformLocation;
+  private readonly _planeAlphaLocation: WebGLUniformLocation;
+  private readonly _planeBlendLocation: WebGLUniformLocation;
   private readonly _atlasTextures: GLTexture[];
   private readonly _attributesBuffer: WebGLBuffer;
 
@@ -520,6 +539,8 @@ export class GlyphRenderer extends Disposable {
   private _rectSkip = new Uint8Array(0);
   private readonly _planeCounts = new Int32Array(MAX_LAYER_TAG + 2);
   private readonly _planeOffsets = new Int32Array(MAX_LAYER_TAG + 2);
+  // Where each plane's cells start in the upload buffer, in cells.
+  private readonly _planeStarts = new Int32Array(MAX_LAYER_TAG + 2);
   private readonly _backing = { count: 0, x: new Uint16Array(0), y: new Uint16Array(0), bg: new Uint32Array(0) };
   private readonly _vertices: IVertices = {
     count: 0,
@@ -566,6 +587,8 @@ export class GlyphRenderer extends Disposable {
     // u_param[] is declared in both stages and links to one shared location;
     // query the first element for portability across drivers.
     this._paramLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_param[0]'));
+    this._planeAlphaLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_planeAlpha'));
+    this._planeBlendLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_planeBlend'));
 
     // Create and set the vertex array object
     this._vertexArrayObject = gl.createVertexArray();
@@ -823,8 +846,11 @@ export class GlyphRenderer extends Disposable {
     if (this._rectSkip.length !== cells) {
       this._rectSkip = new Uint8Array(cells);
     }
+    // A bottom plane with a look of its own is not backed, so it fades and
+    // blends over the canvas rather than over a copy of itself.
+    const backed = isPlain(glyphCfg().planeLooks?.[bottom]);
     for (let sample = 0; sample < cells; sample++) {
-      this._rectSkip[sample] = (layers[sample] + 1 !== bottom || this._flatOver[sample] !== 0) ? 1 : 0;
+      this._rectSkip[sample] = (!backed || layers[sample] + 1 !== bottom || this._flatOver[sample] !== 0) ? 1 : 0;
     }
     const backing = this._backing;
     if (backing.x.length < this._extraCount) {
@@ -833,7 +859,7 @@ export class GlyphRenderer extends Disposable {
       backing.bg = new Uint32Array(this._extraCapacity);
     }
     backing.count = 0;
-    for (let k = 0; k < this._extraCount; k++) {
+    for (let k = 0; k < this._extraCount && backed; k++) {
       if (this._extraTag[k] === bottom && this._extraOver[k] === 0) {
         backing.x[backing.count] = this._extraX[k];
         backing.y[backing.count] = this._extraY[k];
@@ -882,6 +908,7 @@ export class GlyphRenderer extends Disposable {
     let running = 0;
     for (let tag = MAX_LAYER_TAG; tag >= 1; tag--) {
       offsets[tag] = running;
+      this._planeStarts[tag] = running;
       running += counts[tag];
     }
     const copy = (sample: number, tag: number): void => {
@@ -1214,9 +1241,7 @@ export class GlyphRenderer extends Disposable {
       }
     }
 
-    // Bind the attributes buffer
     gl.bindBuffer(gl.ARRAY_BUFFER, this._attributesBuffer);
-    gl.bufferData(gl.ARRAY_BUFFER, activeBuffer.subarray(0, bufferLength), gl.STREAM_DRAW);
 
     // Bind the atlas page texture if they have changed. The texture array
     // is sized at construction (one entry per shader sampler), while the
@@ -1229,8 +1254,29 @@ export class GlyphRenderer extends Disposable {
       }
     }
 
-    // Draw the viewport
-    gl.drawElementsInstanced(gl.TRIANGLE_STRIP, 4, gl.UNSIGNED_BYTE, 0, bufferLength / INDICES_PER_CELL);
+    // Draw the viewport: in one go, or with planes that fade or blend, one
+    // run of planes at a time, each with its blend state.
+    const looks = glyphCfg().planeLooks as Record<number, IPlaneLook> | undefined;
+    gl.uniform1f(this._planeAlphaLocation, 1);
+    gl.uniform1i(this._planeBlendLocation, BlendMode.NORMAL);
+    if (!this._planeMode || !looks || Object.keys(looks).length === 0) {
+      gl.bufferData(gl.ARRAY_BUFFER, activeBuffer.subarray(0, bufferLength), gl.STREAM_DRAW);
+      gl.drawElementsInstanced(gl.TRIANGLE_STRIP, 4, gl.UNSIGNED_BYTE, 0, bufferLength / INDICES_PER_CELL);
+      return;
+    }
+    // WebGL 2 has no base instance, so each run is uploaded on its own.
+    for (const [first, last] of planeRuns(this._planeCounts, MAX_LAYER_TAG, looks)) {
+      const start = this._planeStarts[first];
+      const end = this._planeStarts[last] + this._planeCounts[last];
+      const look = looks[first];
+      const mode = isPlain(look) ? BlendMode.NORMAL : gpuMode(look.blend);
+      gl.uniform1f(this._planeAlphaLocation, planeAlpha(look));
+      gl.uniform1i(this._planeBlendLocation, mode);
+      setBlend(gl, mode);
+      gl.bufferData(gl.ARRAY_BUFFER, activeBuffer.subarray(start * INDICES_PER_CELL, end * INDICES_PER_CELL), gl.STREAM_DRAW);
+      gl.drawElementsInstanced(gl.TRIANGLE_STRIP, 4, gl.UNSIGNED_BYTE, 0, end - start);
+    }
+    setBlend(gl, BlendMode.NORMAL);
   }
 
   public setAtlas(atlas: ITextureAtlas): void {

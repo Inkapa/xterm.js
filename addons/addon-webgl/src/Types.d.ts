@@ -27,6 +27,8 @@ export interface IWebGL2RenderingContext extends WebGLRenderingContext {
   createVertexArray(): IWebGLVertexArrayObject;
   bindVertexArray(vao: IWebGLVertexArrayObject): void;
   drawElementsInstanced(mode: number, count: number, type: number, offset: number, instanceCount: number): void;
+  readonly MIN: number;
+  readonly MAX: number;
 }
 
 export interface IWebGLVertexArrayObject {
