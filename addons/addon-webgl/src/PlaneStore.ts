@@ -4,6 +4,7 @@
  */
 
 import { IDisposable, Terminal } from '@xterm/xterm';
+import { MAX_LAYER_TAG } from './LayerTag';
 import { applyPayload, hashLine, PlaneRow } from './PlanePayload';
 
 /** The private OSC ids the door uses: a row's hidden cells, and the start of a row. */
@@ -79,7 +80,7 @@ export class PlaneStore implements IDisposable {
   private _plane(data: string): boolean {
     const separator = data.indexOf(';');
     const tag = parseInt(data.slice(0, separator), 10);
-    if (separator < 0 || !(tag >= 1 && tag <= 7)) {
+    if (separator < 0 || !(tag >= 1 && tag <= MAX_LAYER_TAG)) {
       return true;
     }
     const buffer = this._terminal.buffer.active;

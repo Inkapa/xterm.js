@@ -4,7 +4,7 @@
  */
 import { assert } from 'chai';
 import { Attributes, BgFlags, FgFlags } from 'common/buffer/Constants';
-import { bgWithoutTag, fgWithoutTag, layerTag } from './LayerTag';
+import { bgWithoutTag, fgWithoutTag, layerTag, MAX_LAYER_TAG } from './LayerTag';
 
 // The flags the door sets for each tag, as the parser leaves them in a cell.
 function flagsFor(tag: number): { fg: number, bg: number } {
@@ -13,12 +13,13 @@ function flagsFor(tag: number): { fg: number, bg: number } {
   if (tag & 1) { fg |= FgFlags.BLINK; }
   if (tag & 2) { fg |= FgFlags.STRIKETHROUGH; }
   if (tag & 4) { bg |= BgFlags.OVERLINE; }
+  if (tag & 8) { bg |= BgFlags.ITALIC; }
   return { fg: fg >>> 0, bg: bg >>> 0 };
 }
 
 describe('layer tag', () => {
   it('reads every tag the door can send', () => {
-    for (let tag = 0; tag <= 7; tag++) {
+    for (let tag = 0; tag <= MAX_LAYER_TAG; tag++) {
       const { fg, bg } = flagsFor(tag);
       assert.equal(layerTag(fg, bg), tag);
     }
@@ -32,8 +33,8 @@ describe('layer tag', () => {
   it('removes the tag and leaves colour and other flags alone', () => {
     const colour = Attributes.CM_RGB | 0x336699;
     const others = FgFlags.BOLD | FgFlags.UNDERLINE | FgFlags.INVERSE;
-    const otherBg = BgFlags.ITALIC | BgFlags.DIM;
-    for (let tag = 0; tag <= 7; tag++) {
+    const otherBg = BgFlags.DIM;
+    for (let tag = 0; tag <= MAX_LAYER_TAG; tag++) {
       const { fg, bg } = flagsFor(tag);
       const cleanFg = fgWithoutTag((colour | others | fg) >>> 0);
       const cleanBg = bgWithoutTag((colour | otherBg | bg) >>> 0);

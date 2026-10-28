@@ -12,7 +12,7 @@ import { Disposable, toDisposable } from 'common/Lifecycle';
 import { Terminal } from '@xterm/xterm';
 import { IRenderModel, IWebGL2RenderingContext, IWebGLVertexArrayObject } from './Types';
 import { backgroundRgba } from './CellBackground';
-import { layerTag } from './LayerTag';
+import { layerTag, MAX_LAYER_TAG } from './LayerTag';
 import { hashLine } from './PlanePayload';
 import { PlaneStore } from './PlaneStore';
 import { createProgram, GLTexture, PROJECTION_MATRIX } from './WebglUtils';
@@ -518,8 +518,8 @@ export class GlyphRenderer extends Disposable {
   private _flatOver = new Uint8Array(0);
   // 1 for a flat cell that must not get a rectangle in plane mode.
   private _rectSkip = new Uint8Array(0);
-  private readonly _planeCounts = new Int32Array(9);
-  private readonly _planeOffsets = new Int32Array(9);
+  private readonly _planeCounts = new Int32Array(MAX_LAYER_TAG + 2);
+  private readonly _planeOffsets = new Int32Array(MAX_LAYER_TAG + 2);
   private readonly _backing = { count: 0, x: new Uint16Array(0), y: new Uint16Array(0), bg: new Uint32Array(0) };
   private readonly _vertices: IVertices = {
     count: 0,
@@ -880,7 +880,7 @@ export class GlyphRenderer extends Disposable {
       counts[this._extraTag[k]]++;
     }
     let running = 0;
-    for (let tag = 7; tag >= 1; tag--) {
+    for (let tag = MAX_LAYER_TAG; tag >= 1; tag--) {
       offsets[tag] = running;
       running += counts[tag];
     }
