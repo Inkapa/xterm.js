@@ -117,6 +117,37 @@ export const blockElementDefinitions: { [index: string]: IBlockVector[] | undefi
   '\u{1FB97}': [{ x: 0, y: 2, w: 8, h: 2 }, { x: 0, y: 6, w: 8, h: 2 }]
 };
 
+// INTEGRAL and BRACKET PIECES, as glyph's 8x16 font draws them (a unit is a
+// pixel across and two down), so a tall integral, bracket or brace joins
+// from row to row the way it does on the native renderers.
+const bracketPieces: { [index: string]: IBlockVector[] } = {
+  '\u{2320}': [{ x: 4, y: 1, w: 3, h: 0.5 }, { x: 3, y: 1.5, w: 2, h: 6.5 }, { x: 6, y: 1.5, w: 2, h: 1 }],
+  '\u{2321}': [{ x: 3, y: 0, w: 2, h: 5.5 }, { x: 0, y: 4.5, w: 2, h: 1 }, { x: 1, y: 5.5, w: 3, h: 0.5 }],
+  '\u{239B}': [{ x: 5, y: 0, w: 1, h: 0.5 }, { x: 4, y: 0.5, w: 1, h: 0.5 }, { x: 3, y: 1, w: 1, h: 1 }, { x: 2, y: 2, w: 1, h: 1.5 }, { x: 1, y: 3.5, w: 1, h: 4.5 }],
+  '\u{239C}': [{ x: 1, y: 0, w: 1, h: 8 }],
+  '\u{239D}': [{ x: 1, y: 0, w: 1, h: 4.5 }, { x: 2, y: 4.5, w: 1, h: 1.5 }, { x: 3, y: 6, w: 1, h: 1 }, { x: 4, y: 7, w: 1, h: 0.5 }, { x: 5, y: 7.5, w: 1, h: 0.5 }],
+  '\u{239E}': [{ x: 1, y: 0, w: 1, h: 0.5 }, { x: 2, y: 0.5, w: 1, h: 0.5 }, { x: 3, y: 1, w: 1, h: 1 }, { x: 4, y: 2, w: 1, h: 1.5 }, { x: 5, y: 3.5, w: 1, h: 4.5 }],
+  '\u{239F}': [{ x: 5, y: 0, w: 1, h: 8 }],
+  '\u{23A0}': [{ x: 5, y: 0, w: 1, h: 4.5 }, { x: 4, y: 4.5, w: 1, h: 1.5 }, { x: 3, y: 6, w: 1, h: 1 }, { x: 2, y: 7, w: 1, h: 0.5 }, { x: 1, y: 7.5, w: 1, h: 0.5 }],
+  '\u{23A1}': [{ x: 1, y: 0, w: 5, h: 0.5 }, { x: 1, y: 0.5, w: 1, h: 7.5 }],
+  '\u{23A2}': [{ x: 1, y: 0, w: 1, h: 8 }],
+  '\u{23A3}': [{ x: 1, y: 0, w: 1, h: 7.5 }, { x: 1, y: 7.5, w: 5, h: 0.5 }],
+  '\u{23A4}': [{ x: 1, y: 0, w: 5, h: 0.5 }, { x: 5, y: 0.5, w: 1, h: 7.5 }],
+  '\u{23A5}': [{ x: 5, y: 0, w: 1, h: 8 }],
+  '\u{23A6}': [{ x: 5, y: 0, w: 1, h: 7.5 }, { x: 1, y: 7.5, w: 5, h: 0.5 }],
+  '\u{23A7}': [{ x: 6, y: 0, w: 2, h: 0.5 }, { x: 5, y: 0.5, w: 2, h: 0.5 }, { x: 4, y: 1, w: 2, h: 0.5 }, { x: 3, y: 1.5, w: 2, h: 6.5 }],
+  '\u{23A8}': [{ x: 3, y: 0, w: 2, h: 3 }, { x: 2, y: 3, w: 2, h: 0.5 }, { x: 1, y: 3.5, w: 2, h: 1 }, { x: 2, y: 4.5, w: 2, h: 0.5 }, { x: 3, y: 5, w: 2, h: 3 }],
+  '\u{23A9}': [{ x: 3, y: 0, w: 2, h: 6.5 }, { x: 4, y: 6.5, w: 2, h: 0.5 }, { x: 5, y: 7, w: 2, h: 0.5 }, { x: 6, y: 7.5, w: 2, h: 0.5 }],
+  '\u{23AA}': [{ x: 3, y: 0, w: 2, h: 8 }],
+  '\u{23AB}': [{ x: 0, y: 0, w: 2, h: 0.5 }, { x: 1, y: 0.5, w: 2, h: 0.5 }, { x: 2, y: 1, w: 2, h: 0.5 }, { x: 3, y: 1.5, w: 2, h: 6.5 }],
+  '\u{23AC}': [{ x: 3, y: 0, w: 2, h: 3 }, { x: 4, y: 3, w: 2, h: 0.5 }, { x: 5, y: 3.5, w: 2, h: 1 }, { x: 4, y: 4.5, w: 2, h: 0.5 }, { x: 3, y: 5, w: 2, h: 3 }],
+  '\u{23AD}': [{ x: 3, y: 0, w: 2, h: 6.5 }, { x: 2, y: 6.5, w: 2, h: 0.5 }, { x: 1, y: 7, w: 2, h: 0.5 }, { x: 0, y: 7.5, w: 2, h: 0.5 }],
+  '\u{23AE}': [{ x: 3, y: 0, w: 2, h: 8 }],
+};
+for (const piece in bracketPieces) {
+  blockElementDefinitions[piece] = bracketPieces[piece];
+}
+
 // BRAILLE PATTERNS and BLOCK SEXTANTS, laid out as glyph's 8x16 font draws
 // them (Spleen's braille dots, sextant rows of 5, 6 and 5 pixels), so every
 // renderer shows the same shapes.
