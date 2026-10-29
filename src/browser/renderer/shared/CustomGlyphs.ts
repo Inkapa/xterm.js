@@ -117,6 +117,35 @@ export const blockElementDefinitions: { [index: string]: IBlockVector[] | undefi
   '\u{1FB97}': [{ x: 0, y: 2, w: 8, h: 2 }, { x: 0, y: 6, w: 8, h: 2 }]
 };
 
+// BRAILLE PATTERNS and BLOCK SEXTANTS, laid out as glyph's 8x16 font draws
+// them (Spleen's braille dots, sextant rows of 5, 6 and 5 pixels), so every
+// renderer shows the same shapes.
+for (let pattern = 0; pattern < 256; pattern++) {
+  const dots: IBlockVector[] = [];
+  for (let dot = 0; dot < 8; dot++) {
+    if (pattern & (1 << dot)) {
+      const column = dot < 3 || dot === 6 ? 0 : 1;
+      const row = dot < 6 ? dot % 3 : 3;
+      dots.push({ x: 1 + column * 4, y: 0.5 + row * 2, w: 2, h: 1 });
+    }
+  }
+  blockElementDefinitions[String.fromCharCode(0x2800 + pattern)] = dots;
+}
+const sextantRows = [{ y: 0, h: 2.5 }, { y: 2.5, h: 3 }, { y: 5.5, h: 2.5 }];
+for (let code = 0x1FB00, pattern = 1; pattern < 63; pattern++) {
+  // The block leaves out the two half blocks Block Elements already has.
+  if (pattern === 21 || pattern === 42) {
+    continue;
+  }
+  const boxes: IBlockVector[] = [];
+  for (let cell = 0; cell < 6; cell++) {
+    if (pattern & (1 << cell)) {
+      boxes.push({ x: (cell % 2) * 4, y: sextantRows[cell >> 1].y, w: 4, h: sextantRows[cell >> 1].h });
+    }
+  }
+  blockElementDefinitions[String.fromCodePoint(code++)] = boxes;
+}
+
 type PatternDefinition = number[][];
 
 /**
