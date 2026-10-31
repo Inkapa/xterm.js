@@ -3,7 +3,7 @@
  * @license MIT
  */
 
-// shaderBgBit maps one background filter name onto its bit in the u_badgl
+// shaderBgBit maps one background filter name onto its bit in the u_geometry
 // mask, in the order the filters compose in the shader.
 function shaderBgBit(name: string): number {
   switch (name.trim()) {
@@ -28,7 +28,7 @@ function shaderBgBit(name: string): number {
 }
 
 // shaderBgModeValue turns the page's background shader field into the
-// u_badgl bitmask, accepting a comma-separated list so filters stack.
+// u_geometry bitmask, accepting a comma-separated list so filters stack.
 function shaderBgModeValue(name: string | undefined): number {
   if (!name) {
     return 0;
@@ -121,7 +121,7 @@ precision lowp float;
 
 in vec4 v_color;
 
-uniform highp int u_badgl;
+uniform highp int u_geometry;
 uniform highp float u_time;
 uniform highp vec2 u_resolution;
 
@@ -152,71 +152,71 @@ void main() {
   // filter stack back toward it (0 = plain background, 1 = full stack).
   vec4 bgClean = outColor;
 
-  // bad-GL background post-processing (window.glyph.shaderBg). u_badgl is a
+  // bad-GL background post-processing (window.glyph.shaderBg). u_geometry is a
   // bitmask (one bit per filter), so several stack in one pass and compose
   // in ascending bit order; shaderBgModeValue ORs the requested modes.
   // Colour-only: the background pass has no texture to re-sample, so the
   // lines and chroma modes are not offered here.
-  if ((u_badgl & 1) != 0) {
+  if ((u_geometry & 1) != 0) {
     // static: animated hash noise over the whole frame
     float n = fract(sin(dot(gl_FragCoord.xy + vec2(u_time * 91.7, u_time * 47.3), vec2(12.9898, 78.233))) * 43758.5453);
     outColor.rgb = mix(outColor.rgb, vec3(n), 0.35);
   }
-  if ((u_badgl & 2) != 0) {
+  if ((u_geometry & 2) != 0) {
     // bands: darken rows in a moving band
     float h = fract(sin(gl_FragCoord.y * 12.9898 + u_time * 53.0) * 43758.5453);
     if (h > 0.7) {
       outColor.rgb *= 0.6;
     }
   }
-  if ((u_badgl & 4) != 0) {
+  if ((u_geometry & 4) != 0) {
     // scan: darken alternating rows
     if (mod(floor(gl_FragCoord.y), 2.0) < 1.0) {
       outColor.rgb *= 0.6;
     }
   }
-  if ((u_badgl & 8) != 0) {
+  if ((u_geometry & 8) != 0) {
     // chan: swap the colour channels
     outColor.rgb = outColor.gbr;
   }
-  if ((u_badgl & 16) != 0) {
+  if ((u_geometry & 16) != 0) {
     // neg: invert the colour; alpha stays, or an opaque cell turns
     // transparent and the frame goes black
     outColor.rgb = vec3(1.0) - outColor.rgb;
   }
-  if ((u_badgl & 32) != 0) {
+  if ((u_geometry & 32) != 0) {
     // fade: translucent background
     outColor.a *= 0.7;
   }
-  if ((u_badgl & 64) != 0) {
+  if ((u_geometry & 64) != 0) {
     // flicker: brightness pulses softly
     outColor.rgb *= 0.92 + 0.08 * sin(u_time * 7.0 + gl_FragCoord.x * 0.13);
   }
-  if ((u_badgl & 128) != 0) {
+  if ((u_geometry & 128) != 0) {
     // vignette: darken toward the screen edges
     vec2 uv = gl_FragCoord.xy / u_resolution;
     float d = distance(uv, vec2(0.5));
     outColor.rgb *= 1.0 - smoothstep(0.35, 0.78, d) * 0.6;
   }
-  if ((u_badgl & 256) != 0) {
+  if ((u_geometry & 256) != 0) {
     // mosaic: block-quantised noise modulates the background colour
     vec2 blk = floor(gl_FragCoord.xy / 16.0);
     float n = fract(sin(dot(blk, vec2(12.9898, 78.233)) + u_time * 0.1) * 43758.5453);
     outColor.rgb *= 0.4 + 0.6 * n;
   }
-  if ((u_badgl & 512) != 0) {
+  if ((u_geometry & 512) != 0) {
     // sweep: a bright bar scans down the screen
     float sy = gl_FragCoord.y / u_resolution.y;
     float bar = smoothstep(0.03, 0.0, abs(fract(sy - u_time * 0.01) - 0.5));
     outColor.rgb += bar * 0.5;
   }
-  if ((u_badgl & 1024) != 0) {
+  if ((u_geometry & 1024) != 0) {
     // dither: 1-bit ordered dithering of the background luminance, the
     // full-screen colour field broken into a black/white stipple
     float lum = dot(outColor.rgb, vec3(0.299, 0.587, 0.114));
     outColor.rgb = vec3(step(ditherThreshold(gl_FragCoord.xy), lum));
   }
-  if ((u_badgl & 2048) != 0) {
+  if ((u_geometry & 2048) != 0) {
     // bayer: colour ordered dither, so the field posterises into stippled
     // bands instead of smooth gradients. u_param[3] scales the step count
     // (default 3 -> 4 levels), matching the glyph renderer.
@@ -224,13 +224,13 @@ void main() {
     float d = ditherThreshold(gl_FragCoord.xy) - 0.5;
     outColor.rgb = clamp(floor(outColor.rgb * steps + 0.5 + d), 0.0, steps) / steps;
   }
-  if ((u_badgl & 4096) != 0) {
+  if ((u_geometry & 4096) != 0) {
     // grays: luminance in four flat steps with no dither, glyph's grays
     // effect (renderers/shaders/grays.glsl) at its four-level look.
     float luminance = dot(outColor.rgb, vec3(0.299, 0.587, 0.114));
     outColor.rgb = vec3(floor(luminance * 3.0 + 0.5) / 3.0);
   }
-  if ((u_badgl & 8192) != 0) {
+  if ((u_geometry & 8192) != 0) {
     // negativebw: a black and white negative, luminance inverted, glyph's
     // negativebw effect (renderers/shaders/negativebw.glsl) at full strength.
     float inverted = 1.0 - dot(outColor.rgb, vec3(0.299, 0.587, 0.114));
@@ -300,7 +300,7 @@ export class RectangleRenderer extends Disposable {
 
     // Uniform locations
     this._projectionLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_projection'));
-    this._badglLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_badgl'));
+    this._badglLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_geometry'));
     this._timeLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_time'));
     this._fragResolutionLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_resolution'));
     this._vtxLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_vtx'));
