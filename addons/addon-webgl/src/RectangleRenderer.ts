@@ -6,7 +6,7 @@
 import { IRenderDimensions } from 'browser/renderer/shared/Types';
 import { IThemeService } from 'browser/services/Services';
 import { ReadonlyColorSet } from 'browser/Types';
-import { Attributes, FgFlags } from 'common/buffer/Constants';
+import { FgFlags } from 'common/buffer/Constants';
 import { Disposable, toDisposable } from 'common/Lifecycle';
 import { IColor } from 'common/Types';
 import { Terminal } from '@xterm/xterm';
@@ -15,6 +15,50 @@ import { IRenderModel, IWebGL2RenderingContext, IWebGLVertexArrayObject } from '
 import { createProgram, expandFloat32Array, PROJECTION_MATRIX } from './WebglUtils';
 import { throwIfFalsy } from 'browser/renderer/shared/RendererUtils';
 import type { ILogService } from 'common/services/Services';
+import { backgroundRgba } from './CellBackground';
+import { vtxModeValue, intensityValue, paramValues } from './GlyphRenderer';
+
+// shaderBgBit maps one background filter name onto its bit in the u_geometry
+// mask, in the order the filters compose in the shader.
+function shaderBgBit(name: string): number {
+  switch (name.trim()) {
+    case 'static': return 1;
+    case 'bands': return 2;
+    case 'scan': return 4;
+    case 'chan': return 8;
+    case 'neg': return 16;
+    case 'fade': return 32;
+    case 'flicker': return 64;
+    case 'vignette': return 128;
+    case 'mosaic': return 256;
+    case 'sweep': return 512;
+    case 'dither': return 1024;
+    case 'bayer': return 2048;
+    case 'grays': return 4096;
+    // glyph's negative effect at full strength is an inversion, so it is neg.
+    case 'negative': return 16;
+    case 'negativebw': return 8192;
+    default: return 0;
+  }
+}
+
+// shaderBgModeValue turns the page's background shader field into the
+// u_geometry bitmask, accepting a comma-separated list so filters stack.
+function shaderBgModeValue(name: string | undefined): number {
+  if (!name) {
+    return 0;
+  }
+  let mask = 0;
+  for (const part of name.split(',')) {
+    mask |= shaderBgBit(part);
+  }
+  return mask;
+}
+
+// The glyph control surface: window.glyph, created by the page.
+function glyphCfg(): any {
+  return (typeof globalThis !== 'undefined' && (globalThis as any).glyph) || {};
+}
 
 const enum VertexAttribLocations {
   POSITION = 0,
@@ -30,12 +74,46 @@ layout (location = ${VertexAttribLocations.COLOR}) in vec4 a_color;
 layout (location = ${VertexAttribLocations.UNIT_QUAD}) in vec2 a_unitquad;
 
 uniform mat4 u_projection;
+uniform highp int u_vtx;
+uniform highp float u_vtime;
+uniform highp float u_intensity;
+// Per-effect knobs, matching the glyph renderer. Slot 0 (warp) scales the
+// distortion so the background warp amount tracks the foreground.
+uniform highp float u_param[4];
 
 out vec4 v_color;
 
+// warpVertex must match the glyph renderer's block exactly so the
+// background bends together with the foreground (window.glyph.vtx).
+vec4 warpVertex(vec4 pos) {
+  vec2 p = pos.xy;
+  if (u_vtx == 1) {
+    pos.xy = p * (1.0 + 0.18 * dot(p, p));
+  } else if (u_vtx == 2) {
+    pos.x += p.y * 0.25;
+  } else if (u_vtx == 3) {
+    pos.xy += vec2(sin(u_vtime * 1.7), cos(u_vtime * 2.3)) * 0.02;
+  } else if (u_vtx == 4) {
+    pos.x += sin(p.y * 10.0 + u_vtime * 0.2) * 0.03;
+  } else if (u_vtx == 5) {
+    pos.xy = p * (1.0 - 0.25 * exp(-dot(p, p) * 3.0));
+  } else if (u_vtx == 6) {
+    float a = length(p) * 0.8 + u_vtime * 0.01;
+    float s = sin(a), c = cos(a);
+    pos.xy = mat2(c, -s, s, c) * p;
+  } else if (u_vtx == 7) {
+    pos.y += mod(u_vtime * 0.02, 2.0) - 1.0;
+  }
+  return pos;
+}
+
 void main() {
   vec2 zeroToOne = a_position + (a_unitquad * a_size);
-  gl_Position = u_projection * vec4(zeroToOne, 0.0, 1.0);
+  vec4 base = u_projection * vec4(zeroToOne, 0.0, 1.0);
+  // Scale the warp by u_intensity, matching the glyph renderer so the
+  // background and foreground fade together; u_param[0] scales the amount.
+  vec4 warped = warpVertex(base);
+  gl_Position = mix(base, base + (warped - base) * u_param[0], u_intensity);
   v_color = a_color;
 }`;
 
@@ -44,10 +122,124 @@ precision lowp float;
 
 in vec4 v_color;
 
+uniform highp int u_geometry;
+uniform highp float u_time;
+uniform highp vec2 u_resolution;
+
 out vec4 outColor;
+
+uniform highp float u_intensity;
+// Per-effect knobs (see paramValues); the background reads slot 3 (dither) to
+// keep its bayer level count in step with the foreground.
+uniform highp float u_param[4];
+
+// 4x4 Bayer ordered-dither threshold matrix (kept in sync with the glyph
+// renderer). Ordered dithering is the single-pass, O(1)-per-fragment
+// stand-in for error diffusion, which is serial and cannot run in one pass.
+const float bayer4x4[16] = float[16](
+   0.0/16.0,  8.0/16.0,  2.0/16.0, 10.0/16.0,
+  12.0/16.0,  4.0/16.0, 14.0/16.0,  6.0/16.0,
+   3.0/16.0, 11.0/16.0,  1.0/16.0,  9.0/16.0,
+  15.0/16.0,  7.0/16.0, 13.0/16.0,  5.0/16.0);
+
+float ditherThreshold(vec2 fragCoord) {
+  ivec2 p = ivec2(mod(fragCoord, 4.0));
+  return bayer4x4[p.y * 4 + p.x];
+}
 
 void main() {
   outColor = v_color;
+  // The untouched background colour, kept so u_intensity can crossfade the
+  // filter stack back toward it (0 = plain background, 1 = full stack).
+  vec4 bgClean = outColor;
+
+  // bad-GL background post-processing (window.glyph.shaderBg). u_geometry is a
+  // bitmask (one bit per filter), so several stack in one pass and compose
+  // in ascending bit order; shaderBgModeValue ORs the requested modes.
+  // Colour-only: the background pass has no texture to re-sample, so the
+  // lines and chroma modes are not offered here.
+  if ((u_geometry & 1) != 0) {
+    // static: animated hash noise over the whole frame
+    float n = fract(sin(dot(gl_FragCoord.xy + vec2(u_time * 91.7, u_time * 47.3), vec2(12.9898, 78.233))) * 43758.5453);
+    outColor.rgb = mix(outColor.rgb, vec3(n), 0.35);
+  }
+  if ((u_geometry & 2) != 0) {
+    // bands: darken rows in a moving band
+    float h = fract(sin(gl_FragCoord.y * 12.9898 + u_time * 53.0) * 43758.5453);
+    if (h > 0.7) {
+      outColor.rgb *= 0.6;
+    }
+  }
+  if ((u_geometry & 4) != 0) {
+    // scan: darken alternating rows
+    if (mod(floor(gl_FragCoord.y), 2.0) < 1.0) {
+      outColor.rgb *= 0.6;
+    }
+  }
+  if ((u_geometry & 8) != 0) {
+    // chan: swap the colour channels
+    outColor.rgb = outColor.gbr;
+  }
+  if ((u_geometry & 16) != 0) {
+    // neg: invert the colour; alpha stays, or an opaque cell turns
+    // transparent and the frame goes black
+    outColor.rgb = vec3(1.0) - outColor.rgb;
+  }
+  if ((u_geometry & 32) != 0) {
+    // fade: translucent background
+    outColor.a *= 0.7;
+  }
+  if ((u_geometry & 64) != 0) {
+    // flicker: brightness pulses softly
+    outColor.rgb *= 0.92 + 0.08 * sin(u_time * 7.0 + gl_FragCoord.x * 0.13);
+  }
+  if ((u_geometry & 128) != 0) {
+    // vignette: darken toward the screen edges
+    vec2 uv = gl_FragCoord.xy / u_resolution;
+    float d = distance(uv, vec2(0.5));
+    outColor.rgb *= 1.0 - smoothstep(0.35, 0.78, d) * 0.6;
+  }
+  if ((u_geometry & 256) != 0) {
+    // mosaic: block-quantised noise modulates the background colour
+    vec2 blk = floor(gl_FragCoord.xy / 16.0);
+    float n = fract(sin(dot(blk, vec2(12.9898, 78.233)) + u_time * 0.1) * 43758.5453);
+    outColor.rgb *= 0.4 + 0.6 * n;
+  }
+  if ((u_geometry & 512) != 0) {
+    // sweep: a bright bar scans down the screen
+    float sy = gl_FragCoord.y / u_resolution.y;
+    float bar = smoothstep(0.03, 0.0, abs(fract(sy - u_time * 0.01) - 0.5));
+    outColor.rgb += bar * 0.5;
+  }
+  if ((u_geometry & 1024) != 0) {
+    // dither: 1-bit ordered dithering of the background luminance, the
+    // full-screen colour field broken into a black/white stipple
+    float lum = dot(outColor.rgb, vec3(0.299, 0.587, 0.114));
+    outColor.rgb = vec3(step(ditherThreshold(gl_FragCoord.xy), lum));
+  }
+  if ((u_geometry & 2048) != 0) {
+    // bayer: colour ordered dither, so the field posterises into stippled
+    // bands instead of smooth gradients. u_param[3] scales the step count
+    // (default 3 -> 4 levels), matching the glyph renderer.
+    float steps = max(1.0, 3.0 * u_param[3]);
+    float d = ditherThreshold(gl_FragCoord.xy) - 0.5;
+    outColor.rgb = clamp(floor(outColor.rgb * steps + 0.5 + d), 0.0, steps) / steps;
+  }
+  if ((u_geometry & 4096) != 0) {
+    // grays: luminance in four flat steps with no dither, glyph's grays
+    // effect (renderers/shaders/grays.glsl) at its four-level look.
+    float luminance = dot(outColor.rgb, vec3(0.299, 0.587, 0.114));
+    outColor.rgb = vec3(floor(luminance * 3.0 + 0.5) / 3.0);
+  }
+  if ((u_geometry & 8192) != 0) {
+    // negativebw: a black and white negative, luminance inverted, glyph's
+    // negativebw effect (renderers/shaders/negativebw.glsl) at full strength.
+    float inverted = 1.0 - dot(outColor.rgb, vec3(0.299, 0.587, 0.114));
+    outColor.rgb = vec3(inverted);
+  }
+
+  // Master crossfade back toward the plain background by u_intensity.
+  outColor = mix(bgClean, outColor, u_intensity);
 }`;
 
 const INDICES_PER_RECTANGLE = 8;
@@ -80,6 +272,14 @@ export class RectangleRenderer extends Disposable {
   private _vertexArrayObject: IWebGLVertexArrayObject;
   private _attributesBuffer: WebGLBuffer;
   private _projectionLocation: WebGLUniformLocation;
+  private _badglLocation: WebGLUniformLocation;
+  private _timeLocation: WebGLUniformLocation;
+  private _fragResolutionLocation: WebGLUniformLocation;
+  private _vtxLocation: WebGLUniformLocation;
+  private _vtimeLocation: WebGLUniformLocation;
+  private _intensityLocation: WebGLUniformLocation;
+  private _paramLocation: WebGLUniformLocation;
+  private _frameCount: number = 0;
   private _bgFloat!: Float32Array;
   private _cursorFloat!: Float32Array;
 
@@ -102,6 +302,13 @@ export class RectangleRenderer extends Disposable {
 
     // Uniform locations
     this._projectionLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_projection'));
+    this._badglLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_geometry'));
+    this._timeLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_time'));
+    this._fragResolutionLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_resolution'));
+    this._vtxLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_vtx'));
+    this._vtimeLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_vtime'));
+    this._intensityLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_intensity'));
+    this._paramLocation = throwIfFalsy(gl.getUniformLocation(this._program, 'u_param[0]'));
 
     // Create and set the vertex array object
     const vertexArrayObject = this._vertexArrayObject = gl.createVertexArray();
@@ -162,6 +369,16 @@ export class RectangleRenderer extends Disposable {
 
     gl.bindVertexArray(this._vertexArrayObject);
 
+    // bad-GL background shader modes, read live per frame.
+    gl.uniform1i(this._badglLocation, shaderBgModeValue(glyphCfg().shaderBg));
+    gl.uniform1f(this._timeLocation, this._frameCount);
+    gl.uniform1i(this._vtxLocation, vtxModeValue(glyphCfg().vtx));
+    gl.uniform1f(this._vtimeLocation, this._frameCount);
+    gl.uniform1f(this._intensityLocation, intensityValue());
+    gl.uniform1fv(this._paramLocation, paramValues());
+    this._frameCount++;
+    gl.uniform2f(this._fragResolutionLocation, gl.canvas.width, gl.canvas.height);
+
     gl.uniformMatrix4fv(this._projectionLocation, false, PROJECTION_MATRIX);
 
     // Bind attributes buffer and draw
@@ -196,7 +413,17 @@ export class RectangleRenderer extends Disposable {
     );
   }
 
-  public updateBackgrounds(model: IRenderModel): void {
+  /**
+   * `backgroundLayers` is the layer each cell resolved to. A cell above the
+   * content layer is drawn opaque by the glyph renderer, with its background
+   * baked into the quad, so it gets no rectangle here: a per-cell mode moves
+   * the quad and a rectangle would stay behind, leaving a copy of the cell
+   * where it used to be. Undefined means every cell keeps its rectangle,
+   * which is the case with no mode on and with tint off. In plane mode the
+   * same array says which cells keep a rectangle (0) and which do not (1), and
+   * `backing` adds the rectangles for the bottom plane's hidden cells.
+   */
+  public updateBackgrounds(model: IRenderModel, backgroundLayers?: Uint8Array, backing?: { count: number, x: Uint16Array, y: Uint16Array, bg: Uint32Array }): void {
     const terminal = this._terminal;
     const vertices = this._vertices;
 
@@ -221,9 +448,17 @@ export class RectangleRenderer extends Disposable {
       currentInverse = false;
       for (x = 0; x < terminal.cols; x++) {
         modelIndex = ((y * terminal.cols) + x) * RenderModelConstants.INDICIES_PER_CELL;
-        bg = model.cells[modelIndex + RenderModelConstants.BG_OFFSET];
-        fg = model.cells[modelIndex + RenderModelConstants.FG_OFFSET];
-        inverse = !!(fg & FgFlags.INVERSE);
+        if (backgroundLayers !== undefined && backgroundLayers[y * terminal.cols + x] > 0) {
+          // Reads as the default background, so the run in progress ends
+          // here and no rectangle is emitted for this cell.
+          bg = 0;
+          fg = 0;
+          inverse = false;
+        } else {
+          bg = model.cells[modelIndex + RenderModelConstants.BG_OFFSET];
+          fg = model.cells[modelIndex + RenderModelConstants.FG_OFFSET];
+          inverse = !!(fg & FgFlags.INVERSE);
+        }
         if (bg !== currentBg || (fg !== currentFg && (currentInverse || inverse))) {
           // A rectangle needs to be drawn if going from non-default to another color
           if (currentBg !== 0 || (currentInverse && currentFg !== 0)) {
@@ -240,6 +475,14 @@ export class RectangleRenderer extends Disposable {
       if (currentBg !== 0 || (currentInverse && currentFg !== 0)) {
         offset = rectangleCount++ * INDICES_PER_RECTANGLE;
         this._updateRectangle(vertices, offset, currentFg, currentBg, currentStartX, terminal.cols, y);
+      }
+    }
+    // The bottom plane's cells another plane covers, at rest. They have no
+    // place in the model, which holds only what shows.
+    if (backing) {
+      for (let k = 0; k < backing.count; k++) {
+        offset = rectangleCount++ * INDICES_PER_RECTANGLE;
+        this._updateRectangle(vertices, offset, 0, backing.bg[k], backing.x[k], backing.x[k] + 1, backing.y[k]);
       }
     }
     vertices.count = rectangleCount;
@@ -311,37 +554,14 @@ export class RectangleRenderer extends Disposable {
   }
 
   private _updateRectangle(vertices: Vertices, offset: number, fg: number, bg: number, startX: number, endX: number, y: number): void {
-    if (fg & FgFlags.INVERSE) {
-      switch (fg & Attributes.CM_MASK) {
-        case Attributes.CM_P16:
-        case Attributes.CM_P256:
-          $rgba = this._themeService.colors.ansi[fg & Attributes.PCOLOR_MASK].rgba;
-          break;
-        case Attributes.CM_RGB:
-          $rgba = (fg & Attributes.RGB_MASK) << 8;
-          break;
-        case Attributes.CM_DEFAULT:
-        default:
-          $rgba = this._themeService.colors.foreground.rgba;
-      }
-    } else {
-      switch (bg & Attributes.CM_MASK) {
-        case Attributes.CM_P16:
-        case Attributes.CM_P256:
-          $rgba = this._themeService.colors.ansi[bg & Attributes.PCOLOR_MASK].rgba;
-          break;
-        case Attributes.CM_RGB:
-          $rgba = (bg & Attributes.RGB_MASK) << 8;
-          break;
-        case Attributes.CM_DEFAULT:
-        default:
-          $rgba = this._themeService.colors.background.rgba;
-      }
-    }
+    $rgba = backgroundRgba(this._themeService, fg, bg);
 
     if (vertices.attributes.length < offset + INDICES_PER_RECTANGLE) {
-      // +1 for the viewport-clear rectangle at offset 0.
-      vertices.attributes = expandFloat32Array(vertices.attributes, (this._terminal.rows * this._terminal.cols + 1) * INDICES_PER_RECTANGLE);
+      // One rectangle per cell, +1 for the viewport-clear rectangle at offset
+      // 0, is the most a frame without planes needs. A frame with planes adds
+      // rectangles for the bottom plane's hidden cells, so the cap gives way to
+      // what this rectangle needs.
+      vertices.attributes = expandFloat32Array(vertices.attributes, Math.max((this._terminal.rows * this._terminal.cols + 1) * INDICES_PER_RECTANGLE, (offset + INDICES_PER_RECTANGLE) * 2));
     }
     $x1 = startX * this._dimensions.device.cell.width;
     $y1 = y * this._dimensions.device.cell.height;

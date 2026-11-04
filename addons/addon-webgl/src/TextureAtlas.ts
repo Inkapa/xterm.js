@@ -313,6 +313,10 @@ export class TextureAtlas implements ITextureAtlas {
     return this._getFromCacheMap(this._cacheMap, code, bg, fg, ext, restrictToCellHeight, domContainer);
   }
 
+  public hasRasterizedGlyph(code: number, bg: number, fg: number, ext: number): boolean {
+    return this._cacheMap.get(code, cacheKeyColor(bg), cacheKeyColor(fg), ext) !== undefined;
+  }
+
   /**
    * Gets the glyphs texture coords, drawing the texture if it's not already
    */

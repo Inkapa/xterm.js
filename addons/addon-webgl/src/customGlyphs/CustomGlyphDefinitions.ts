@@ -3,7 +3,7 @@
  * @license MIT
  */
 
-import { CustomGlyphDefinitionType, CustomGlyphScaleType, CustomGlyphVectorType, type CustomGlyphCharacterDefinition, type CustomGlyphDefinitionPart, type CustomGlyphPathDrawFunctionDefinition } from './Types';
+import { CustomGlyphDefinitionType, CustomGlyphScaleType, CustomGlyphVectorType, type CustomGlyphCharacterDefinition, type CustomGlyphDefinitionPart, type CustomGlyphPathDrawFunctionDefinition, type ICustomGlyphSolidOctantBlockVector } from './Types';
 
 /* oxlint-disable @stylistic/max-len -- generated glyph path data */
 
@@ -848,6 +848,71 @@ export const customGlyphDefinitions: { [index: string]: CustomGlyphCharacterDefi
 
   // #endregion
 };
+
+// glyph's own pieces, drawn the way its 8x16 font draws them (a unit is a
+// pixel across and two down), so these look the same on every glyph
+// renderer. They replace the stock shapes for the same code points.
+function solidBoxes(data: ICustomGlyphSolidOctantBlockVector[]): CustomGlyphDefinitionPart {
+  return { type: CustomGlyphDefinitionType.SOLID_OCTANT_BLOCK_VECTOR, data };
+}
+
+// INTEGRAL and BRACKET PIECES, so a tall integral, bracket or brace joins
+// from row to row.
+const bracketPieces: { [index: string]: ICustomGlyphSolidOctantBlockVector[] } = {
+  '\u{2320}': [{ x: 4, y: 1, w: 3, h: 0.5 }, { x: 3, y: 1.5, w: 2, h: 6.5 }, { x: 6, y: 1.5, w: 2, h: 1 }],
+  '\u{2321}': [{ x: 3, y: 0, w: 2, h: 5.5 }, { x: 0, y: 4.5, w: 2, h: 1 }, { x: 1, y: 5.5, w: 3, h: 0.5 }],
+  '\u{239B}': [{ x: 5, y: 0, w: 1, h: 0.5 }, { x: 4, y: 0.5, w: 1, h: 0.5 }, { x: 3, y: 1, w: 1, h: 1 }, { x: 2, y: 2, w: 1, h: 1.5 }, { x: 1, y: 3.5, w: 1, h: 4.5 }],
+  '\u{239C}': [{ x: 1, y: 0, w: 1, h: 8 }],
+  '\u{239D}': [{ x: 1, y: 0, w: 1, h: 4.5 }, { x: 2, y: 4.5, w: 1, h: 1.5 }, { x: 3, y: 6, w: 1, h: 1 }, { x: 4, y: 7, w: 1, h: 0.5 }, { x: 5, y: 7.5, w: 1, h: 0.5 }],
+  '\u{239E}': [{ x: 1, y: 0, w: 1, h: 0.5 }, { x: 2, y: 0.5, w: 1, h: 0.5 }, { x: 3, y: 1, w: 1, h: 1 }, { x: 4, y: 2, w: 1, h: 1.5 }, { x: 5, y: 3.5, w: 1, h: 4.5 }],
+  '\u{239F}': [{ x: 5, y: 0, w: 1, h: 8 }],
+  '\u{23A0}': [{ x: 5, y: 0, w: 1, h: 4.5 }, { x: 4, y: 4.5, w: 1, h: 1.5 }, { x: 3, y: 6, w: 1, h: 1 }, { x: 2, y: 7, w: 1, h: 0.5 }, { x: 1, y: 7.5, w: 1, h: 0.5 }],
+  '\u{23A1}': [{ x: 1, y: 0, w: 5, h: 0.5 }, { x: 1, y: 0.5, w: 1, h: 7.5 }],
+  '\u{23A2}': [{ x: 1, y: 0, w: 1, h: 8 }],
+  '\u{23A3}': [{ x: 1, y: 0, w: 1, h: 7.5 }, { x: 1, y: 7.5, w: 5, h: 0.5 }],
+  '\u{23A4}': [{ x: 1, y: 0, w: 5, h: 0.5 }, { x: 5, y: 0.5, w: 1, h: 7.5 }],
+  '\u{23A5}': [{ x: 5, y: 0, w: 1, h: 8 }],
+  '\u{23A6}': [{ x: 5, y: 0, w: 1, h: 7.5 }, { x: 1, y: 7.5, w: 5, h: 0.5 }],
+  '\u{23A7}': [{ x: 6, y: 0, w: 2, h: 0.5 }, { x: 5, y: 0.5, w: 2, h: 0.5 }, { x: 4, y: 1, w: 2, h: 0.5 }, { x: 3, y: 1.5, w: 2, h: 6.5 }],
+  '\u{23A8}': [{ x: 3, y: 0, w: 2, h: 3 }, { x: 2, y: 3, w: 2, h: 0.5 }, { x: 1, y: 3.5, w: 2, h: 1 }, { x: 2, y: 4.5, w: 2, h: 0.5 }, { x: 3, y: 5, w: 2, h: 3 }],
+  '\u{23A9}': [{ x: 3, y: 0, w: 2, h: 6.5 }, { x: 4, y: 6.5, w: 2, h: 0.5 }, { x: 5, y: 7, w: 2, h: 0.5 }, { x: 6, y: 7.5, w: 2, h: 0.5 }],
+  '\u{23AA}': [{ x: 3, y: 0, w: 2, h: 8 }],
+  '\u{23AB}': [{ x: 0, y: 0, w: 2, h: 0.5 }, { x: 1, y: 0.5, w: 2, h: 0.5 }, { x: 2, y: 1, w: 2, h: 0.5 }, { x: 3, y: 1.5, w: 2, h: 6.5 }],
+  '\u{23AC}': [{ x: 3, y: 0, w: 2, h: 3 }, { x: 4, y: 3, w: 2, h: 0.5 }, { x: 5, y: 3.5, w: 2, h: 1 }, { x: 4, y: 4.5, w: 2, h: 0.5 }, { x: 3, y: 5, w: 2, h: 3 }],
+  '\u{23AD}': [{ x: 3, y: 0, w: 2, h: 6.5 }, { x: 2, y: 6.5, w: 2, h: 0.5 }, { x: 1, y: 7, w: 2, h: 0.5 }, { x: 0, y: 7.5, w: 2, h: 0.5 }],
+  '\u{23AE}': [{ x: 3, y: 0, w: 2, h: 8 }]
+};
+for (const piece in bracketPieces) {
+  customGlyphDefinitions[piece] = solidBoxes(bracketPieces[piece]);
+}
+
+// BRAILLE PATTERNS as Spleen's dots, and BLOCK SEXTANTS in rows of 5, 6 and
+// 5 pixels.
+for (let pattern = 0; pattern < 256; pattern++) {
+  const dots: ICustomGlyphSolidOctantBlockVector[] = [];
+  for (let dot = 0; dot < 8; dot++) {
+    if (pattern & (1 << dot)) {
+      const column = dot < 3 || dot === 6 ? 0 : 1;
+      const row = dot < 6 ? dot % 3 : 3;
+      dots.push({ x: 1 + column * 4, y: 0.5 + row * 2, w: 2, h: 1 });
+    }
+  }
+  customGlyphDefinitions[String.fromCharCode(0x2800 + pattern)] = solidBoxes(dots);
+}
+const sextantRows = [{ y: 0, h: 2.5 }, { y: 2.5, h: 3 }, { y: 5.5, h: 2.5 }];
+for (let code = 0x1FB00, pattern = 1; pattern < 63; pattern++) {
+  // The block leaves out the two half blocks Block Elements already has.
+  if (pattern === 21 || pattern === 42) {
+    continue;
+  }
+  const boxes: ICustomGlyphSolidOctantBlockVector[] = [];
+  for (let cell = 0; cell < 6; cell++) {
+    if (pattern & (1 << cell)) {
+      boxes.push({ x: (cell % 2) * 4, y: sextantRows[cell >> 1].y, w: 4, h: sextantRows[cell >> 1].h });
+    }
+  }
+  customGlyphDefinitions[String.fromCodePoint(code++)] = solidBoxes(boxes);
+}
 
 export const blockPatternCodepoints = new Set<number>([
   // Shade characters (2591-2593)

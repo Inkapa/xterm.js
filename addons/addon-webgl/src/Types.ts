@@ -31,6 +31,8 @@ export interface IWebGL2RenderingContext extends WebGLRenderingContext {
   deleteVertexArray(vao: IWebGLVertexArrayObject): void;
   bindVertexArray(vao: IWebGLVertexArrayObject): void;
   drawElementsInstanced(mode: number, count: number, type: number, offset: number, instanceCount: number): void;
+  readonly MIN: number;
+  readonly MAX: number;
 }
 
 export interface IWebGLVertexArrayObject {
@@ -80,6 +82,8 @@ export interface ITextureAtlas extends IDisposable {
    */
   clearTexture(): void;
   getRasterizedGlyph(code: number, bg: number, fg: number, ext: number, restrictToCellHeight: boolean, domContainer: HTMLElement | undefined): IRasterizedGlyph;
+  /** Whether getRasterizedGlyph would be a cache hit, without drawing anything. */
+  hasRasterizedGlyph(code: number, bg: number, fg: number, ext: number): boolean;
   getRasterizedGlyphCombinedChar(chars: string, bg: number, fg: number, ext: number, restrictToCellHeight: boolean, domContainer: HTMLElement | undefined): IRasterizedGlyph;
   /**
    * The resolved foreground colour (packed 0xRRGGBBAA) for a cell, which the

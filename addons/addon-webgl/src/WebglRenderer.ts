@@ -17,7 +17,10 @@ import { Attributes, Content, FgFlags, NULL_CELL_CHAR, NULL_CELL_CODE } from 'co
 import { TextBlinkStateManager } from 'browser/renderer/shared/TextBlinkStateManager';
 import { ICoreService, IDecorationService, ILogService, IOptionsService } from 'common/services/Services';
 import { Terminal } from '@xterm/xterm';
-import { GlyphRenderer } from './GlyphRenderer';
+import { GlyphRenderer, percellModule } from './GlyphRenderer';
+import { bgWithoutTag, fgWithoutTag } from './LayerTag';
+import { PlaneStore } from './PlaneStore';
+import { MoshRenderer } from './MoshRenderer';
 import { RectangleRenderer } from './RectangleRenderer';
 import { COMBINED_CHAR_BIT_MASK, RenderModel, RenderModelConstants } from './RenderModel';
 import { IWebGL2RenderingContext, type ITextureAtlas } from './Types';
@@ -34,6 +37,9 @@ const enum Constants {
 
 export class WebglRenderer extends Disposable implements IRenderer {
   private _renderLayers: IRenderLayer[];
+  // The plane payloads the door sends, read by the glyph pass and the
+  // rectangle pass (see PlaneStore).
+  private readonly _planes: PlaneStore;
   private _cursorBlinkStateManager: MutableDisposable<CursorBlinkStateManager> = this._register(new MutableDisposable());
   private _textBlinkStateManager: TextBlinkStateManager;
   private _charAtlasDisposable = this._register(new MutableDisposable());
@@ -46,12 +52,16 @@ export class WebglRenderer extends Disposable implements IRenderer {
   private _rowHasBlinkingCells: boolean[] = [];
   private _rowHasBlinkingCellsCount: number = 0;
   private _workCell: ICellData = new CellData();
+  private _workCell2: ICellData = new CellData();
+  // Whether a per-cell mode was on for the last model update.
+  private _percellWasActive = false;
   private _cellColorResolver: CellColorResolver;
 
   private _canvas: HTMLCanvasElement;
   private _gl: IWebGL2RenderingContext;
   private _rectangleRenderer: MutableDisposable<RectangleRenderer> = this._register(new MutableDisposable());
   private _glyphRenderer: MutableDisposable<GlyphRenderer> = this._register(new MutableDisposable());
+  private _moshRenderer: MutableDisposable<MoshRenderer> = this._register(new MutableDisposable());
 
   public readonly dimensions: IRenderDimensions;
 
@@ -104,6 +114,8 @@ export class WebglRenderer extends Disposable implements IRenderer {
     this._cellColorResolver = new CellColorResolver(this._terminal, this._optionsService, this._model.selection, this._decorationService, this._coreBrowserService, this._themeService);
 
     this._core = (this._terminal as any)._core;
+    this._planes = new PlaneStore(this._terminal);
+    this._register(toDisposable(() => this._planes.dispose()));
 
     this._renderLayers = [
       new LinkRenderLayer(this._core.screenElement!, 2, this._terminal, this._core.linkifier!, this._coreBrowserService, _optionsService, this._themeService)
@@ -285,7 +297,8 @@ export class WebglRenderer extends Disposable implements IRenderer {
    */
   private _initializeWebGLState(): [RectangleRenderer, GlyphRenderer] {
     this._rectangleRenderer.value = new RectangleRenderer(this._terminal, this._gl, this.dimensions, this._themeService, this._logService);
-    this._glyphRenderer.value = new GlyphRenderer(this._terminal, this._gl, this.dimensions, this._optionsService, this._logService);
+    this._glyphRenderer.value = new GlyphRenderer(this._terminal, this._gl, this.dimensions, this._optionsService, this._logService, this._themeService);
+    this._moshRenderer.value = new MoshRenderer(this._gl, this._logService);
 
     // Update dimensions and acquire char atlas
     this.handleCharSizeChanged();
@@ -381,7 +394,7 @@ export class WebglRenderer extends Disposable implements IRenderer {
     // Tell renderer the frame is beginning
     // upon a model clear also refresh the full viewport model
     // (also triggered by an atlas page merge, part of #4480)
-    if (this._glyphRenderer.value.beginFrame()) {
+    if (this._glyphRenderer.value.beginFrame(this._core.buffer, this._planes)) {
       this._clearModel(true);
       this._updateModel(0, this._terminal.rows - 1);
     } else {
@@ -408,6 +421,8 @@ export class WebglRenderer extends Disposable implements IRenderer {
     if (!this._cursorBlinkStateManager.value || this._cursorBlinkStateManager.value.isCursorVisible) {
       this._rectangleRenderer.value.renderCursor();
     }
+    // Feedback last: it folds the finished frame into the trails it keeps.
+    this._moshRenderer.value?.render();
   }
 
   private _updateCursorBlink(): void {
@@ -445,6 +460,13 @@ export class WebglRenderer extends Disposable implements IRenderer {
     let i: number;
     let x: number;
     let j: number;
+    // The shared per-cell modes change every frame, so while one is on no
+    // cell can be skipped for having unchanged content.
+    const percellActive = percellModule() !== undefined;
+    // Cells drawn opaque while a mode was on carry that in their vertices,
+    // so the frame after it goes off has to rewrite them too.
+    const forceUpdate = percellActive || this._percellWasActive;
+    this._percellWasActive = percellActive;
     start = clamp(start, terminal.rows - 1, 0);
     end = clamp(end, terminal.rows - 1, 0);
     const cursorStyle = this._coreService.decPrivateModes.cursorStyle ?? terminal.options.cursorStyle ?? 'block';
@@ -483,6 +505,12 @@ export class WebglRenderer extends Disposable implements IRenderer {
       for (x = 0; x < terminal.cols; x++) {
         lastBg = this._cellColorResolver.result.bg;
         line.loadCell(x, cell);
+        // The layer tag rides in these flags. The renderer reads it from the
+        // buffer before this loop runs, so here it is only removed: left in,
+        // strikethrough and overline would draw a line through the cell and
+        // give it a second atlas entry.
+        cell.fg = fgWithoutTag(cell.fg);
+        cell.bg = bgWithoutTag(cell.bg);
 
         if (x === 0) {
           lastBg = this._cellColorResolver.result.bg;
@@ -575,7 +603,8 @@ export class WebglRenderer extends Disposable implements IRenderer {
         }
 
         // Nothing has changed, no updates needed
-        if (this._model.cells[i] === code &&
+        if (!forceUpdate &&
+            this._model.cells[i] === code &&
             this._model.cells[i + RenderModelConstants.BG_OFFSET] === this._cellColorResolver.result.bg &&
             this._model.cells[i + RenderModelConstants.FG_OFFSET] === this._cellColorResolver.result.fg &&
             this._model.cells[i + RenderModelConstants.EXT_OFFSET] === this._cellColorResolver.result.ext) {
@@ -615,7 +644,7 @@ export class WebglRenderer extends Disposable implements IRenderer {
       this._setRowBlinkState(y, rowHasBlinkingCells);
     }
     if (modelUpdated) {
-      this._rectangleRenderer.value!.updateBackgrounds(this._model);
+      this._rectangleRenderer.value!.updateBackgrounds(this._model, this._glyphRenderer.value?.backgroundLayers, this._glyphRenderer.value?.backing);
     }
     this._rectangleRenderer.value!.updateCursor(this._model);
     this._updateTextBlinkState();
