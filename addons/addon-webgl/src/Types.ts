@@ -76,6 +76,8 @@ export interface ITextureAtlas extends IDisposable {
    * be a consume-once flag.
    */
   readonly pageLayoutVersion: number;
+  /** Rebuild every cell every frame while raised (see TextureAtlas.rebuildLatch). */
+  rebuildLatch: boolean;
 
   /**
    * Clear all glyphs from the texture atlas.

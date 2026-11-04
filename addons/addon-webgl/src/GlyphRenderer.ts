@@ -757,7 +757,7 @@ export class GlyphRenderer extends Disposable {
       this._lastSeenPageLayoutVersion = this._atlas.pageLayoutVersion;
       return true;
     }
-    return false;
+    return this._atlas.rebuildLatch;
   }
 
   /**

@@ -161,6 +161,14 @@ export class TextureAtlas implements ITextureAtlas {
 
   private _pageLayoutVersion = 0;
   public get pageLayoutVersion(): number { return this._pageLayoutVersion; }
+  /**
+   * While raised, the glyph renderer rebuilds every cell every frame. A page
+   * merge raises it and nothing lowers it, which is xterm 5's behaviour and
+   * glyph's scrambled-stamp effect: once a capped atlas tips over, glyphs are
+   * re-indexed against pages that keep moving. Upstream rebuilds once per
+   * layout change instead. glyph's page raises and lowers it by hand.
+   */
+  public rebuildLatch = false;
 
   public clearTexture(): void {
     if (this._pages[0].currentRow.x === 0 && this._pages[0].currentRow.y === 0) {
@@ -238,6 +246,7 @@ export class TextureAtlas implements ITextureAtlas {
 
       // Invalidate renderer models so all texture pages are refreshed.
       this._pageLayoutVersion++;
+      this.rebuildLatch = true;
       this._onAddTextureAtlasCanvas.fire(mergedPage.canvas);
     }
 
