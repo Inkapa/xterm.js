@@ -31,7 +31,8 @@ const enum VertexAttribLocations {
   SIZE = 3,
   TEXPAGE = 4,
   TEXCOORD = 5,
-  TEXSIZE = 6
+  TEXSIZE = 6,
+  COLOR = 7
 }
 
 const vertexShaderSource = `#version 300 es
@@ -42,30 +43,37 @@ layout (location = ${VertexAttribLocations.SIZE}) in vec2 a_size;
 layout (location = ${VertexAttribLocations.TEXPAGE}) in float a_texpage;
 layout (location = ${VertexAttribLocations.TEXCOORD}) in vec2 a_texcoord;
 layout (location = ${VertexAttribLocations.TEXSIZE}) in vec2 a_texsize;
+layout (location = ${VertexAttribLocations.COLOR}) in vec4 a_color;
 
 uniform mat4 u_projection;
 uniform vec2 u_resolution;
 
 out vec2 v_texcoord;
 flat out int v_texpage;
+out vec4 v_color;
 
 void main() {
   vec2 zeroToOne = (a_offset / u_resolution) + a_cellpos + (a_unitquad * a_size);
   gl_Position = u_projection * vec4(zeroToOne, 0.0, 1.0);
   v_texpage = int(a_texpage);
   v_texcoord = a_texcoord + a_unitquad * a_texsize;
+  v_color = a_color;
 }`;
 
 function createFragmentShaderSource(maxFragmentShaderTextureUnits: number): string {
   let textureConditionals = '';
   for (let i = 1; i < maxFragmentShaderTextureUnits; i++) {
-    textureConditionals += ` else if (v_texpage == ${i}) { outColor = texture(u_texture[${i}], v_texcoord); }`;
+    textureConditionals += ` else if (v_texpage == ${i}) { outColor = v_color * texture(u_texture[${i}], v_texcoord); }`;
   }
   return (`#version 300 es
 precision lowp float;
 
 in vec2 v_texcoord;
 flat in int v_texpage;
+// A tinted atlas holds white coverage masks and v_color is the cell's
+// foreground; a colour-baked atlas already holds the colour and v_color is
+// white.
+in vec4 v_color;
 
 uniform sampler2D u_texture[${maxFragmentShaderTextureUnits}];
 
@@ -73,13 +81,18 @@ out vec4 outColor;
 
 void main() {
   if (v_texpage == 0) {
-    outColor = texture(u_texture[0], v_texcoord);
+    outColor = v_color * texture(u_texture[0], v_texcoord);
   } ${textureConditionals}
 }`);
 }
 
+// Per-cell instanced attributes, in float order:
+//   [0,1] offset  [2,3] size  [4] texpage  [5,6] texcoord  [7,8] texsize
+//   [9..12] colour (rgba)  [13,14] cellpos
+// cellpos is last so a cell that draws nothing can zero everything before it;
+// it is written once per resize in clear().
 const enum Constants {
-  INDICES_PER_CELL = 11,
+  INDICES_PER_CELL = 15,
   BYTES_PER_CELL = INDICES_PER_CELL * 4/* Float32Array.BYTES_PER_ELEMENT */,
   CELL_POSITION_INDICES = 2
 }
@@ -89,6 +102,7 @@ let $i = 0;
 let $glyph: IRasterizedGlyph | undefined = undefined;
 let $leftCellPadding = 0;
 let $clippedPixels = 0;
+let $fgRgba = 0;
 
 export class GlyphRenderer extends Disposable {
   private readonly _program: WebGLProgram;
@@ -180,8 +194,11 @@ export class GlyphRenderer extends Disposable {
     gl.enableVertexAttribArray(VertexAttribLocations.TEXSIZE);
     gl.vertexAttribPointer(VertexAttribLocations.TEXSIZE, 2, gl.FLOAT, false, Constants.BYTES_PER_CELL, 7 * Float32Array.BYTES_PER_ELEMENT);
     gl.vertexAttribDivisor(VertexAttribLocations.TEXSIZE, 1);
+    gl.enableVertexAttribArray(VertexAttribLocations.COLOR);
+    gl.vertexAttribPointer(VertexAttribLocations.COLOR, 4, gl.FLOAT, false, Constants.BYTES_PER_CELL, 9 * Float32Array.BYTES_PER_ELEMENT);
+    gl.vertexAttribDivisor(VertexAttribLocations.COLOR, 1);
     gl.enableVertexAttribArray(VertexAttribLocations.CELL_POSITION);
-    gl.vertexAttribPointer(VertexAttribLocations.CELL_POSITION, 2, gl.FLOAT, false, Constants.BYTES_PER_CELL, 9 * Float32Array.BYTES_PER_ELEMENT);
+    gl.vertexAttribPointer(VertexAttribLocations.CELL_POSITION, 2, gl.FLOAT, false, Constants.BYTES_PER_CELL, 13 * Float32Array.BYTES_PER_ELEMENT);
     gl.vertexAttribDivisor(VertexAttribLocations.CELL_POSITION, 1);
 
     // Setup static uniforms
@@ -244,7 +261,7 @@ export class GlyphRenderer extends Disposable {
     // Exit early if this is a null character, allow space character to continue as it may have
     // underline/strikethrough styles
     if (code === NULL_CELL_CODE || code === undefined/* This is used for the right side of wide chars */) {
-      array.fill(0, $i, $i + Constants.INDICES_PER_CELL - 1 - Constants.CELL_POSITION_INDICES);
+      array.fill(0, $i, $i + Constants.INDICES_PER_CELL - Constants.CELL_POSITION_INDICES);
       return;
     }
 
@@ -292,6 +309,20 @@ export class GlyphRenderer extends Disposable {
       array[$i + 7] = $glyph.sizeClipSpace.x;
       array[$i + 8] = $glyph.sizeClipSpace.y;
     }
+    // a_color: the cell's foreground for a tinted mask, white for a glyph
+    // whose colour is already baked into the atlas.
+    if (TextureAtlas.tintGlyphs) {
+      $fgRgba = this._atlas.getFgColor(bg, fg, ext, chars && chars.length > 1 ? chars.charCodeAt(0) : code);
+      array[$i + 9] = (($fgRgba >>> 24) & 0xFF) / 255;
+      array[$i + 10] = (($fgRgba >>> 16) & 0xFF) / 255;
+      array[$i + 11] = (($fgRgba >>> 8) & 0xFF) / 255;
+      array[$i + 12] = ($fgRgba & 0xFF) / 255;
+    } else {
+      array[$i + 9] = 1;
+      array[$i + 10] = 1;
+      array[$i + 11] = 1;
+      array[$i + 12] = 1;
+    }
     // a_cellpos only changes on resize
 
     // Reduce scale horizontally for wide glyphs printed in cells that would overlap with the
@@ -325,8 +356,8 @@ export class GlyphRenderer extends Disposable {
     i = 0;
     for (let y = 0; y < terminal.rows; y++) {
       for (let x = 0; x < terminal.cols; x++) {
-        this._vertices.attributes[i + 9] = x / terminal.cols;
-        this._vertices.attributes[i + 10] = y / terminal.rows;
+        this._vertices.attributes[i + 13] = x / terminal.cols;
+        this._vertices.attributes[i + 14] = y / terminal.rows;
         i += Constants.INDICES_PER_CELL;
       }
     }
